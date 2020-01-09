@@ -18,7 +18,7 @@
 Name:    dbus
 Epoch:   1
 Version: 1.10.24
-Release: 13%{?dist}
+Release: 7%{?dist}
 Summary: D-BUS message bus
 
 Group:   System Environment/Libraries
@@ -42,8 +42,6 @@ Patch3: dbus-1.6.12-avoid-selinux-context-translation.patch
 Patch4: dbus-1.10.24-dbus-send-man-page-typo.patch
 # https://bugzilla.redhat.com/show_bug.cgi?id=1529044
 Patch5: 0001-bus-raise-fd-limits-before-dropping-privs.patch
-# https://bugzilla.redhat.com/show_bug.cgi?id=1470310
-Patch6: dbus-1.10.24-dbus-launch-chdir.patch
 
 BuildRequires: libtool
 BuildRequires: expat-devel >= %{expat_version}
@@ -144,7 +142,6 @@ in this separate package so server systems need not install X.
 %patch3 -p1
 %patch4 -p1
 %patch5 -p1
-%patch6 -p1
 
 %build
 # Avoid rpath.
@@ -187,7 +184,6 @@ install -Dp -m755 %{SOURCE1} %{buildroot}%{_sysconfdir}/X11/xinit/xinitrc.d/00-s
 install --directory %{buildroot}%{_sysconfdir}/dbus-1/session.d
 install --directory %{buildroot}%{_sysconfdir}/dbus-1/system.d
 
-# This directory is a somewhat unofficial downstream addition
 install --directory %{buildroot}%{_datadir}/dbus-1/interfaces
 
 # Make sure that when somebody asks for D-Bus under the name of the
@@ -198,13 +194,6 @@ ln -s dbus.service %{buildroot}%{_unitdir}/messagebus.service
 ## %find_lang %{gettext_package}
 # Delete the old legacy sysv init script
 rm -rf %{buildroot}%{_initrddir}
-
-# Ensure that the launcher helper location is unchanged when upgrading from old
-# versions that placed it in lib as opposed to libexecdir.
-# https://bugzilla.redhat.com/show_bug.cgi?id=1568856
-mkdir -p %{buildroot}/%{_lib}/dbus-1
-ln -s %{_libexecdir}/dbus-1/dbus-daemon-launch-helper \
-      %{buildroot}/%{_lib}/dbus-1/dbus-daemon-launch-helper
 
 # Ensure that the ghosted directory has reasonable permissions.
 install --directory %{buildroot}/run/dbus
@@ -341,7 +330,6 @@ popd
 # See doc/system-activation.txt in source tarball for the rationale
 # behind these permissions
 %attr(4750,root,dbus) %{_libexecdir}/dbus-1/dbus-daemon-launch-helper
-/%{_lib}/dbus-1/
 %exclude %{_libexecdir}/dbus-1/dbus-run-installed-tests
 %{_unitdir}/dbus.service
 %{_unitdir}/dbus.socket
@@ -381,15 +369,6 @@ popd
 %{_includedir}/*
 
 %changelog
-* Tue Dec 11 2018 David King <dking@redhat.com> - 1:1.10.24-13
-- Add a symlink for dbus-daemon-launch-helper (#1568856)
-
-* Tue Aug 21 2018 Ray Strode <rstrode@redhat.com> - 1:1.10.24-12
-- Use HOME as dbus-daemon --session working directory (#1470310)
-
-* Fri Jun 22 2018 David King <dking@redhat.com> - 1:1.10.24-11
-- Use HOME as dbus-launch working directory (#1470310)
-
 * Thu Feb 15 2018 David King <dking@redhat.com> - 1:1.10.24-7
 - Improve permissions on /run/dbus (#1510773)
 
