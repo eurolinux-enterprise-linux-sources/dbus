@@ -9,7 +9,7 @@ Summary: D-BUS message bus
 Name: dbus
 Epoch: 1
 Version: 1.2.24
-Release: 8%{?dist}
+Release: 9%{?dist}
 URL: http://www.freedesktop.org/software/dbus/
 Source0: http://dbus.freedesktop.org/releases/dbus/%{name}-%{version}.tar.gz
 Source1: doxygen_to_devhelp.xsl
@@ -53,6 +53,9 @@ Patch6: 0001-CVE-2012-3524-Don-t-access-environment-variables-or-.patch
 
 # https://bugzilla.redhat.com/show_bug.cgi?id=1118456
 Patch7: dbus-1.2.24-fix-dbus-command-for-pid-fd-leak.patch
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=1268972
+Patch8: dbus-1.2.24-add-dbus-run-session.patch
 
 %description
 D-BUS is a system for sending messages between applications. It is
@@ -112,6 +115,7 @@ in this separate package so server systems need not install X.
 %patch5 -p1
 %patch6 -p1
 %patch7 -p1
+%patch8 -p1
 
 autoreconf -f -i
 
@@ -205,10 +209,12 @@ fi
 /bin/dbus-send
 /bin/dbus-cleanup-sockets
 /bin/dbus-monitor
+/bin/dbus-run-session
 /bin/dbus-uuidgen
 %{_mandir}/man*/dbus-cleanup-sockets.1.gz
 %{_mandir}/man*/dbus-daemon.1.gz
 %{_mandir}/man*/dbus-monitor.1.gz
+%{_mandir}/man*/dbus-run-session.1.gz
 %{_mandir}/man*/dbus-send.1.gz
 %{_mandir}/man*/dbus-uuidgen.1.gz
 %dir %{_datadir}/dbus-1
@@ -247,6 +253,9 @@ fi
 %{_includedir}/*
 
 %changelog
+* Tue Apr 03 2018 David King <dking@redhat.com> - 1:1.2.24-9
+- Add dbus-run-session (#1268972)
+
 * Fri Feb 06 2015 David King <dking@redhat.com> - 1:1.2.24-8
 - Fix fd leak in _dbus_command_for_pid (#1118456)
 
