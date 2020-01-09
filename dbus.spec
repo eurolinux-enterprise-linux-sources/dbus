@@ -18,7 +18,7 @@
 Name:    dbus
 Epoch:   1
 Version: 1.10.24
-Release: 12%{?dist}
+Release: 13%{?dist}
 Summary: D-BUS message bus
 
 Group:   System Environment/Libraries
@@ -199,6 +199,13 @@ ln -s dbus.service %{buildroot}%{_unitdir}/messagebus.service
 # Delete the old legacy sysv init script
 rm -rf %{buildroot}%{_initrddir}
 
+# Ensure that the launcher helper location is unchanged when upgrading from old
+# versions that placed it in lib as opposed to libexecdir.
+# https://bugzilla.redhat.com/show_bug.cgi?id=1568856
+mkdir -p %{buildroot}/%{_lib}/dbus-1
+ln -s %{_libexecdir}/dbus-1/dbus-daemon-launch-helper \
+      %{buildroot}/%{_lib}/dbus-1/dbus-daemon-launch-helper
+
 # Ensure that the ghosted directory has reasonable permissions.
 install --directory %{buildroot}/run/dbus
 
@@ -334,6 +341,7 @@ popd
 # See doc/system-activation.txt in source tarball for the rationale
 # behind these permissions
 %attr(4750,root,dbus) %{_libexecdir}/dbus-1/dbus-daemon-launch-helper
+/%{_lib}/dbus-1/
 %exclude %{_libexecdir}/dbus-1/dbus-run-installed-tests
 %{_unitdir}/dbus.service
 %{_unitdir}/dbus.socket
@@ -373,6 +381,9 @@ popd
 %{_includedir}/*
 
 %changelog
+* Tue Dec 11 2018 David King <dking@redhat.com> - 1:1.10.24-13
+- Add a symlink for dbus-daemon-launch-helper (#1568856)
+
 * Tue Aug 21 2018 Ray Strode <rstrode@redhat.com> - 1:1.10.24-12
 - Use HOME as dbus-daemon --session working directory (#1470310)
 
