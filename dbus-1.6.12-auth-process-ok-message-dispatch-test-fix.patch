@@ -1,0 +1,47 @@
+From b17615cda8a7ec80692d84e544b71e8183461aa5 Mon Sep 17 00:00:00 2001
+From: Roy Li <rongqing.li@windriver.com>
+Date: Wed, 21 Jan 2015 09:28:53 +0000
+Subject: [PATCH] dbus: clear guid_from_server if send_negotiate_unix_fd failed
+
+Once send_negotiate_unix_fd failed, this failure will happen, since
+auth->guid_from_server has been set to some value before
+send_negotiate_unix_fd. send_negotiate_unix_fd failure will lead to this
+auth be handled by process_ok again, but this auth->guid_from_server is
+not zero.
+
+So we should clear auth->guid_from_server if send_negotiate_unix_fd
+failed.
+
+http://lists.freedesktop.org/archives/dbus/2014-February/016122.html
+https://bugs.freedesktop.org/show_bug.cgi?id=75589
+https://bugzilla.redhat.com/show_bug.cgi?id=1183755
+
+Signed-off-by: Roy Li <rongqing.li@windriver.com>
+---
+ dbus/dbus-auth.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/dbus/dbus-auth.c b/dbus/dbus-auth.c
+index d2c37a7..dd6e61d 100644
+--- a/dbus/dbus-auth.c
++++ b/dbus/dbus-auth.c
+@@ -1572,7 +1572,15 @@ process_ok(DBusAuth *auth,
+                  _dbus_string_get_const_data (& DBUS_AUTH_CLIENT (auth)->guid_from_server));
+ 
+   if (auth->unix_fd_possible)
+-    return send_negotiate_unix_fd(auth);
++    {
++      if (!send_negotiate_unix_fd (auth))
++        {
++          _dbus_string_set_length (& DBUS_AUTH_CLIENT (auth)->guid_from_server, 0);
++          return FALSE;
++        }
++
++      return TRUE;
++    }
+ 
+   _dbus_verbose("Not negotiating unix fd passing, since not possible\n");
+   return send_begin (auth);
+-- 
+2.2.1
+

@@ -1,0 +1,27 @@
+From e0034acc5253a443eeb9232b316eb987c44ce3e7 Mon Sep 17 00:00:00 2001
+From: Colin Walters <walters@verbum.org>
+Date: Mon, 11 Nov 2013 15:55:26 -0500
+Subject: [PATCH] tests: Disable name-test
+
+This wants to access $DISPLAY, which isn't available in mock.
+---
+ test/name-test/Makefile.am | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/test/name-test/Makefile.am b/test/name-test/Makefile.am
+index 6aaf178..48a9cda 100644
+--- a/test/name-test/Makefile.am
++++ b/test/name-test/Makefile.am
+@@ -13,7 +13,8 @@ AM_LDFLAGS = @R_DYNAMIC_LDFLAG@
+ ## TESTS
+ if DBUS_BUILD_TESTS
+ TESTS_ENVIRONMENT=DBUS_TOP_BUILDDIR=@abs_top_builddir@ DBUS_TOP_SRCDIR=@abs_top_srcdir@ PYTHON=@PYTHON@
+-TESTS=run-test.sh run-test-systemserver.sh
++# Disabling due to attempting to access $DISPLAY
++#TESTS=run-test.sh run-test-systemserver.sh
+ else
+ TESTS=
+ endif
+-- 
+1.8.3.1
+
