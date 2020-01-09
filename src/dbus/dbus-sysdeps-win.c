@@ -6,7 +6,7 @@
  * Copyright (C) 2005 Novell, Inc.
  * Copyright (C) 2006 Peter Kümmel  <syntheticpp@gmx.net>
  * Copyright (C) 2006 Christian Ehrlicher <ch.ehrlicher@gmx.de>
- * Copyright (C) 2006-2010 Ralf Habacker <ralf.habacker@freenet.de>
+ * Copyright (C) 2006-2013 Ralf Habacker <ralf.habacker@freenet.de>
  *
  * Licensed under the Academic Free License version 2.1
  * 
@@ -52,14 +52,15 @@
 #include "dbus-credentials.h"
 
 #include <windows.h>
-#include <ws2tcpip.h>
 #include <wincrypt.h>
+#include <iphlpapi.h>
 
-/* Declarations missing in mingw's headers */
+/* Declarations missing in mingw's and windows sdk 7.0 headers */
 extern BOOL WINAPI ConvertStringSidToSidA (LPCSTR  StringSid, PSID *Sid);
 extern BOOL WINAPI ConvertSidToStringSidA (PSID Sid, LPSTR *StringSid);
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <string.h>
 #if HAVE_ERRNO_H
@@ -76,18 +77,13 @@ extern BOOL WINAPI ConvertSidToStringSidA (PSID Sid, LPSTR *StringSid);
 #include <ws2tcpip.h>
 #endif
 
-#ifdef HAVE_WSPIAPI_H
-// needed for w2k compatibility (getaddrinfo/freeaddrinfo/getnameinfo)
-#ifdef __GNUC__
-#define _inline
-#include "wspiapi.h"
-#else
-#include <wspiapi.h>
-#endif
-#endif // HAVE_WSPIAPI_H
-
 #ifndef O_BINARY
 #define O_BINARY 0
+#endif
+
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+/* MinGW32 < 4 does not define this value in its headers */
+#define PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
 #endif
 
 typedef int socklen_t;
@@ -103,6 +99,203 @@ _dbus_win_set_errno (int err)
 #endif
 }
 
+static BOOL is_winxp_sp3_or_lower();
+
+/*
+ * _MIB_TCPROW_EX and friends are not available in system headers
+ *  and are mapped to attribute identical ...OWNER_PID typedefs.
+ */
+typedef MIB_TCPROW_OWNER_PID _MIB_TCPROW_EX;
+typedef MIB_TCPTABLE_OWNER_PID MIB_TCPTABLE_EX;
+typedef PMIB_TCPTABLE_OWNER_PID PMIB_TCPTABLE_EX;
+typedef DWORD (WINAPI *ProcAllocateAndGetTcpExtTableFromStack)(PMIB_TCPTABLE_EX*,BOOL,HANDLE,DWORD,DWORD);
+static ProcAllocateAndGetTcpExtTableFromStack lpfnAllocateAndGetTcpExTableFromStack = NULL;
+
+/**
+ * AllocateAndGetTcpExTableFromStack() is undocumented and not exported,
+ * but is the only way to do this in older XP versions.
+ * @return true if the procedures could be loaded
+ */
+static BOOL
+load_ex_ip_helper_procedures(void)
+{
+  HMODULE hModule = LoadLibrary ("iphlpapi.dll");
+  if (hModule == NULL)
+    {
+      _dbus_verbose ("could not load iphlpapi.dll\n");
+      return FALSE;
+    }
+
+  lpfnAllocateAndGetTcpExTableFromStack = (ProcAllocateAndGetTcpExtTableFromStack)GetProcAddress (hModule, "AllocateAndGetTcpExTableFromStack");
+  if (lpfnAllocateAndGetTcpExTableFromStack == NULL)
+    {
+      _dbus_verbose ("could not find function AllocateAndGetTcpExTableFromStack in iphlpapi.dll\n");
+      return FALSE;
+    }
+  return TRUE;
+}
+
+/**
+ * get pid from localhost tcp connection using peer_port
+ * This function is available on WinXP >= SP3
+ * @param peer_port peers tcp port
+ * @return process id or 0 if connection has not been found
+ */
+static dbus_pid_t
+get_pid_from_extended_tcp_table(int peer_port)
+{
+  dbus_pid_t result;
+  DWORD errorCode, size = 0, i;
+  MIB_TCPTABLE_OWNER_PID *tcp_table;
+
+  if ((errorCode =
+       GetExtendedTcpTable (NULL, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)) == ERROR_INSUFFICIENT_BUFFER)
+    {
+      tcp_table = (MIB_TCPTABLE_OWNER_PID *) dbus_malloc (size);
+      if (tcp_table == NULL)
+        {
+          _dbus_verbose ("Error allocating memory\n");
+          return 0;
+        }
+    }
+  else
+    {
+      _dbus_win_warn_win_error ("unexpected error returned from GetExtendedTcpTable", errorCode);
+      return 0;
+    }
+
+  if ((errorCode = GetExtendedTcpTable (tcp_table, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)) != NO_ERROR)
+    {
+      _dbus_verbose ("Error fetching tcp table %d\n", (int)errorCode);
+      dbus_free (tcp_table);
+      return 0;
+    }
+
+  result = 0;
+  for (i = 0; i < tcp_table->dwNumEntries; i++)
+    {
+      MIB_TCPROW_OWNER_PID *p = &tcp_table->table[i];
+      int local_address = ntohl (p->dwLocalAddr);
+      int local_port = ntohs (p->dwLocalPort);
+      if (p->dwState == MIB_TCP_STATE_ESTAB
+          && local_address == INADDR_LOOPBACK && local_port == peer_port)
+         result = p->dwOwningPid;
+    }
+
+  dbus_free (tcp_table);
+  _dbus_verbose ("got pid %lu\n", result);
+  return result;
+}
+
+/**
+ * get pid from localhost tcp connection using peer_port
+ * This function is available on all WinXP versions, but
+ * not in wine (at least version <= 1.6.0)
+ * @param peer_port peers tcp port
+ * @return process id or 0 if connection has not been found
+ */
+static dbus_pid_t
+get_pid_from_tcp_ex_table(int peer_port)
+{
+  dbus_pid_t result;
+  DWORD errorCode, i;
+  PMIB_TCPTABLE_EX tcp_table = NULL;
+
+  if (!load_ex_ip_helper_procedures ())
+    {
+      _dbus_verbose
+        ("Error not been able to load iphelper procedures\n");
+      return 0;
+    }
+
+  errorCode = lpfnAllocateAndGetTcpExTableFromStack (&tcp_table, TRUE, GetProcessHeap(), 0, 2);
+
+  if (errorCode != NO_ERROR)
+    {
+      _dbus_verbose
+        ("Error not been able to call AllocateAndGetTcpExTableFromStack()\n");
+      return 0;
+    }
+
+  result = 0;
+  for (i = 0; i < tcp_table->dwNumEntries; i++)
+    {
+      _MIB_TCPROW_EX *p = &tcp_table->table[i];
+      int local_port = ntohs (p->dwLocalPort);
+      int local_address = ntohl (p->dwLocalAddr);
+      if (local_address == INADDR_LOOPBACK && local_port == peer_port)
+        {
+          result = p->dwOwningPid;
+          break;
+        }
+    }
+
+  HeapFree (GetProcessHeap(), 0, tcp_table);
+  _dbus_verbose ("got pid %lu\n", result);
+  return result;
+}
+
+/**
+ * @brief return peer process id from tcp handle for localhost connections
+ * @param handle tcp socket descriptor
+ * @return process id or 0 in case the process id could not be fetched
+ */
+static dbus_pid_t
+_dbus_get_peer_pid_from_tcp_handle (int handle)
+{
+  struct sockaddr_storage addr;
+  socklen_t len = sizeof (addr);
+  int peer_port;
+
+  dbus_pid_t result;
+  dbus_bool_t is_localhost = FALSE;
+
+  getpeername (handle, (struct sockaddr *) &addr, &len);
+
+  if (addr.ss_family == AF_INET)
+    {
+      struct sockaddr_in *s = (struct sockaddr_in *) &addr;
+      peer_port = ntohs (s->sin_port);
+      is_localhost = (ntohl (s->sin_addr.s_addr) == INADDR_LOOPBACK);
+    }
+  else if (addr.ss_family == AF_INET6)
+    {
+      _dbus_verbose ("FIXME [61922]: IPV6 support not working on windows\n");
+      return 0;
+      /*
+         struct sockaddr_in6 *s = (struct sockaddr_in6 * )&addr;
+         peer_port = ntohs (s->sin6_port);
+         is_localhost = (memcmp(s->sin6_addr.s6_addr, in6addr_loopback.s6_addr, 16) == 0);
+         _dbus_verbose ("IPV6 %08x %08x\n", s->sin6_addr.s6_addr, in6addr_loopback.s6_addr);
+       */
+    }
+  else
+    {
+      _dbus_verbose ("no idea what address family %d is\n", addr.ss_family);
+      return 0;
+    }
+
+  if (!is_localhost)
+    {
+      _dbus_verbose ("could not fetch process id from remote process\n");
+      return 0;
+    }
+
+  if (peer_port == 0)
+    {
+      _dbus_verbose
+        ("Error not been able to fetch tcp peer port from connection\n");
+      return 0;
+    }
+
+  _dbus_verbose ("trying to get peer's pid\n");
+
+  result = get_pid_from_extended_tcp_table (peer_port);
+  if (result > 0)
+      return result;
+  result = get_pid_from_tcp_ex_table (peer_port);
+  return result;
+}
 
 /* Convert GetLastError() to a dbus error.  */
 const char*
@@ -182,7 +375,7 @@ _dbus_win_free_error_string (char *string)
  */
 
 int
-_dbus_read_socket (int               fd,
+_dbus_read_socket (DBusSocket        fd,
                    DBusString       *buffer,
                    int               count)
 {
@@ -204,8 +397,8 @@ _dbus_read_socket (int               fd,
 
  again:
  
-  _dbus_verbose ("recv: count=%d fd=%d\n", count, fd);
-  bytes_read = recv (fd, data, count, 0);
+  _dbus_verbose ("recv: count=%d fd=%Iu\n", count, fd.sock);
+  bytes_read = recv (fd.sock, data, count, 0);
   
   if (bytes_read == SOCKET_ERROR)
 	{
@@ -252,7 +445,7 @@ _dbus_read_socket (int               fd,
  * @returns the number of bytes written or -1 on error
  */
 int
-_dbus_write_socket (int               fd,
+_dbus_write_socket (DBusSocket        fd,
                     const DBusString *buffer,
                     int               start,
                     int               len)
@@ -264,8 +457,8 @@ _dbus_write_socket (int               fd,
 
  again:
 
-  _dbus_verbose ("send: len=%d fd=%d\n", len, fd);
-  bytes_written = send (fd, data, len, 0);
+  _dbus_verbose ("send: len=%d fd=%Iu\n", len, fd.sock);
+  bytes_written = send (fd.sock, data, len, 0);
 
   if (bytes_written == SOCKET_ERROR)
     {
@@ -296,13 +489,13 @@ _dbus_write_socket (int               fd,
  * @returns #FALSE if error set
  */
 dbus_bool_t
-_dbus_close_socket (int        fd,
+_dbus_close_socket (DBusSocket fd,
                     DBusError *error)
 {
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
  again:
-  if (closesocket (fd) == SOCKET_ERROR)
+  if (closesocket (fd.sock) == SOCKET_ERROR)
     {
       DBUS_SOCKET_SET_ERRNO ();
       
@@ -310,11 +503,11 @@ _dbus_close_socket (int        fd,
         goto again;
         
       dbus_set_error (error, _dbus_error_from_errno (errno),
-                      "Could not close socket: socket=%d, , %s",
-                      fd, _dbus_strerror_from_errno ());
+                      "Could not close socket: socket=%Iu, , %s",
+                      fd.sock, _dbus_strerror_from_errno ());
       return FALSE;
     }
-  _dbus_verbose ("_dbus_close_socket: socket=%d, \n", fd);
+  _dbus_verbose ("_dbus_close_socket: socket=%Iu, \n", fd.sock);
 
   return TRUE;
 }
@@ -324,10 +517,10 @@ _dbus_close_socket (int        fd,
  * on exec. Should be called for all file
  * descriptors in D-Bus code.
  *
- * @param fd the file descriptor
+ * @param handle the Windows HANDLE (a SOCKET is also OK)
  */
-void
-_dbus_fd_set_close_on_exec (intptr_t handle)
+static void
+_dbus_win_handle_set_close_on_exec (HANDLE handle)
 {
   if ( !SetHandleInformation( (HANDLE) handle,
                         HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE,
@@ -340,24 +533,24 @@ _dbus_fd_set_close_on_exec (intptr_t handle)
 /**
  * Sets a file descriptor to be nonblocking.
  *
- * @param fd the file descriptor.
+ * @param handle the file descriptor.
  * @param error address of error location.
  * @returns #TRUE on success.
  */
 dbus_bool_t
-_dbus_set_fd_nonblocking (int             handle,
-                          DBusError      *error)
+_dbus_set_socket_nonblocking (DBusSocket      handle,
+                              DBusError      *error)
 {
   u_long one = 1;
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
-  if (ioctlsocket (handle, FIONBIO, &one) == SOCKET_ERROR)
+  if (ioctlsocket (handle.sock, FIONBIO, &one) == SOCKET_ERROR)
     {
       DBUS_SOCKET_SET_ERRNO ();
       dbus_set_error (error, _dbus_error_from_errno (errno),
-                      "Failed to set socket %d:%d to nonblocking: %s", handle,
-                      _dbus_strerror_from_errno ());
+                      "Failed to set socket %Iu to nonblocking: %s",
+                      handle.sock, _dbus_strerror_from_errno ());
       return FALSE;
     }
 
@@ -386,7 +579,7 @@ _dbus_set_fd_nonblocking (int             handle,
  * @returns total bytes written from both buffers, or -1 on error
  */
 int
-_dbus_write_socket_two (int               fd,
+_dbus_write_socket_two (DBusSocket        fd,
                         const DBusString *buffer1,
                         int               start1,
                         int               len1,
@@ -425,8 +618,8 @@ _dbus_write_socket_two (int               fd,
 
  again:
  
-  _dbus_verbose ("WSASend: len1+2=%d+%d fd=%d\n", len1, len2, fd);
-  rc = WSASend (fd, 
+  _dbus_verbose ("WSASend: len1+2=%d+%d fd=%Iu\n", len1, len2, fd.sock);
+  rc = WSASend (fd.sock,
                 vectors,
                 data2 ? 2 : 1, 
                 &bytes_written,
@@ -449,12 +642,6 @@ _dbus_write_socket_two (int               fd,
   return bytes_written;
 }
 
-dbus_bool_t
-_dbus_socket_is_invalid (int fd)
-{
-    return fd == INVALID_SOCKET ? TRUE : FALSE;
-}
-
 #if 0
 
 /**
@@ -474,21 +661,26 @@ _dbus_connect_named_pipe (const char     *path,
 
 #endif
 
-
-
-void
+/**
+ * @returns #FALSE if no memory
+ */
+dbus_bool_t
 _dbus_win_startup_winsock (void)
 {
   /* Straight from MSDN, deuglified */
 
+  /* Protected by _DBUS_LOCK_sysdeps */
   static dbus_bool_t beenhere = FALSE;
 
   WORD wVersionRequested;
   WSADATA wsaData;
   int err;
 
+  if (!_DBUS_LOCK (sysdeps))
+    return FALSE;
+
   if (beenhere)
-    return;
+    goto out;
 
   wVersionRequested = MAKEWORD (2, 0);
 
@@ -512,6 +704,10 @@ _dbus_win_startup_winsock (void)
     }
 
   beenhere = TRUE;
+
+out:
+  _DBUS_UNLOCK (sysdeps);
+  return TRUE;
 }
 
 
@@ -743,22 +939,62 @@ _dbus_pid_for_log (void)
   return _dbus_getpid ();
 }
 
-
 #ifndef DBUS_WINCE
+
+static BOOL is_winxp_sp3_or_lower()
+{
+   OSVERSIONINFOEX osvi;
+   DWORDLONG dwlConditionMask = 0;
+   int op=VER_LESS_EQUAL;
+
+   // Initialize the OSVERSIONINFOEX structure.
+
+   ZeroMemory(&osvi, sizeof(OSVERSIONINFOEX));
+   osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
+   osvi.dwMajorVersion = 5;
+   osvi.dwMinorVersion = 1;
+   osvi.wServicePackMajor = 3;
+   osvi.wServicePackMinor = 0;
+
+   // Initialize the condition mask.
+
+   VER_SET_CONDITION( dwlConditionMask, VER_MAJORVERSION, op );
+   VER_SET_CONDITION( dwlConditionMask, VER_MINORVERSION, op );
+   VER_SET_CONDITION( dwlConditionMask, VER_SERVICEPACKMAJOR, op );
+   VER_SET_CONDITION( dwlConditionMask, VER_SERVICEPACKMINOR, op );
+
+   // Perform the test.
+
+   return VerifyVersionInfo(
+      &osvi,
+      VER_MAJORVERSION | VER_MINORVERSION |
+      VER_SERVICEPACKMAJOR | VER_SERVICEPACKMINOR,
+      dwlConditionMask);
+}
+
 /** Gets our SID
- * @param points to sid buffer, need to be freed with LocalFree()
+ * @param sid points to sid buffer, need to be freed with LocalFree()
+ * @param process_id the process id for which the sid should be returned (use 0 for current process)
  * @returns process sid
  */
-static dbus_bool_t
-_dbus_getsid(char **sid)
+dbus_bool_t
+_dbus_getsid(char **sid, dbus_pid_t process_id)
 {
   HANDLE process_token = INVALID_HANDLE_VALUE;
   TOKEN_USER *token_user = NULL;
   DWORD n;
   PSID psid;
   int retval = FALSE;
-  
-  if (!OpenProcessToken (GetCurrentProcess (), TOKEN_QUERY, &process_token)) 
+
+  HANDLE process_handle;
+  if (process_id == 0)
+    process_handle = GetCurrentProcess();
+  else if (is_winxp_sp3_or_lower())
+    process_handle = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, process_id);
+  else
+    process_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+
+  if (!OpenProcessToken (process_handle, TOKEN_QUERY, &process_token))
     {
       _dbus_win_warn_win_error ("OpenProcessToken failed", GetLastError ());
       goto failed;
@@ -786,10 +1022,11 @@ _dbus_getsid(char **sid)
   retval = TRUE;
 
 failed:
+  CloseHandle (process_handle);
   if (process_token != INVALID_HANDLE_VALUE)
     CloseHandle (process_token);
 
-  _dbus_verbose("_dbus_getsid() returns %d\n",retval);
+  _dbus_verbose("_dbus_getsid() got '%s' and returns %d\n", *sid, retval);
   return retval;
 }
 #endif
@@ -801,27 +1038,33 @@ failed:
  ************************************************************************/
 
 /**
- * Creates a full-duplex pipe (as in socketpair()).
- * Sets both ends of the pipe nonblocking.
+ * Creates pair of connect sockets (as in socketpair()).
+ * Sets both ends of the pair nonblocking.
+ *
+ * Marks both file descriptors as close-on-exec
  *
  * @param fd1 return location for one end
  * @param fd2 return location for the other end
- * @param blocking #TRUE if pipe should be blocking
+ * @param blocking #TRUE if pair should be blocking
  * @param error error return
  * @returns #FALSE on failure (if error is set)
  */
 dbus_bool_t
-_dbus_full_duplex_pipe (int        *fd1,
-                        int        *fd2,
-                        dbus_bool_t blocking,
-                        DBusError  *error)
+_dbus_socketpair (DBusSocket *fd1,
+                  DBusSocket *fd2,
+                  dbus_bool_t blocking,
+                  DBusError  *error)
 {
   SOCKET temp, socket1 = -1, socket2 = -1;
   struct sockaddr_in saddr;
   int len;
   u_long arg;
 
-  _dbus_win_startup_winsock ();
+  if (!_dbus_win_startup_winsock ())
+    {
+      _DBUS_SET_OOM (error);
+      return FALSE;
+    }
 
   temp = socket (AF_INET, SOCK_STREAM, 0);
   if (temp == INVALID_SOCKET)
@@ -891,11 +1134,11 @@ _dbus_full_duplex_pipe (int        *fd1,
         }
     }
 
-  *fd1 = socket1;
-  *fd2 = socket2;
+  fd1->sock = socket1;
+  fd2->sock = socket2;
 
-  _dbus_verbose ("full-duplex pipe %d:%d <-> %d:%d\n",
-                 *fd1, socket1, *fd2, socket2);
+  _dbus_verbose ("full-duplex pipe %Iu:%Iu <-> %Iu:%Iu\n",
+                 fd1->sock, socket1, fd2->sock, socket2);
 
   closesocket (temp);
 
@@ -959,12 +1202,12 @@ _dbus_poll (DBusPollFD *fds,
 
 
       if (fdp->events & _DBUS_POLLIN)
-        msgp += sprintf (msgp, "R:%d ", fdp->fd);
+        msgp += sprintf (msgp, "R:%Iu ", fdp->fd.sock);
 
       if (fdp->events & _DBUS_POLLOUT)
-        msgp += sprintf (msgp, "W:%d ", fdp->fd);
+        msgp += sprintf (msgp, "W:%Iu ", fdp->fd.sock);
 
-      msgp += sprintf (msgp, "E:%d\n\t", fdp->fd);
+      msgp += sprintf (msgp, "E:%Iu\n\t", fdp->fd.sock);
 
       // FIXME: more robust code for long  msg
       //        create on heap when msg[] becomes too small
@@ -991,7 +1234,7 @@ _dbus_poll (DBusPollFD *fds,
       if (fdp->events & _DBUS_POLLOUT)
         lNetworkEvents |= FD_WRITE | FD_CONNECT;
 
-      WSAEventSelect(fdp->fd, ev, lNetworkEvents);
+      WSAEventSelect(fdp->fd.sock, ev, lNetworkEvents);
 
       pEvents[i] = ev;
     }
@@ -1023,7 +1266,7 @@ _dbus_poll (DBusPollFD *fds,
 
           fdp->revents = 0;
 
-          WSAEnumNetworkEvents(fdp->fd, pEvents[i], &ne);
+          WSAEnumNetworkEvents(fdp->fd.sock, pEvents[i], &ne);
 
           if (ne.lNetworkEvents & (FD_READ | FD_ACCEPT | FD_CLOSE))
             fdp->revents |= _DBUS_POLLIN;
@@ -1035,20 +1278,20 @@ _dbus_poll (DBusPollFD *fds,
             fdp->revents |= _DBUS_POLLERR;
 
           if (ne.lNetworkEvents & (FD_READ | FD_ACCEPT | FD_CLOSE))
-              msgp += sprintf (msgp, "R:%d ", fdp->fd);
+              msgp += sprintf (msgp, "R:%Iu ", fdp->fd.sock);
 
           if (ne.lNetworkEvents & (FD_WRITE | FD_CONNECT))
-              msgp += sprintf (msgp, "W:%d ", fdp->fd);
+              msgp += sprintf (msgp, "W:%Iu ", fdp->fd.sock);
 
           if (ne.lNetworkEvents & (FD_OOB))
-              msgp += sprintf (msgp, "E:%d ", fdp->fd);
+              msgp += sprintf (msgp, "E:%Iu ", fdp->fd.sock);
 
           msgp += sprintf (msgp, "lNetworkEvents:%d ", ne.lNetworkEvents);
 
           if(ne.lNetworkEvents)
             ret++;
 
-          WSAEventSelect(fdp->fd, pEvents[i], 0);
+          WSAEventSelect(fdp->fd.sock, pEvents[i], 0);
         }
 
       msgp += sprintf (msgp, "\n");
@@ -1077,7 +1320,7 @@ _dbus_poll (DBusPollFD *fds,
   char *msgp;
 
   fd_set read_set, write_set, err_set;
-  int max_fd = 0;
+  SOCKET max_fd = 0;
   int i;
   struct timeval tv;
   int ready;
@@ -1096,12 +1339,12 @@ _dbus_poll (DBusPollFD *fds,
 
 
       if (fdp->events & _DBUS_POLLIN)
-        msgp += sprintf (msgp, "R:%d ", fdp->fd);
+        msgp += sprintf (msgp, "R:%Iu ", fdp->fd.sock);
 
       if (fdp->events & _DBUS_POLLOUT)
-        msgp += sprintf (msgp, "W:%d ", fdp->fd);
+        msgp += sprintf (msgp, "W:%Iu ", fdp->fd.sock);
 
-      msgp += sprintf (msgp, "E:%d\n\t", fdp->fd);
+      msgp += sprintf (msgp, "E:%Iu\n\t", fdp->fd.sock);
 
       // FIXME: more robust code for long  msg
       //        create on heap when msg[] becomes too small
@@ -1119,14 +1362,14 @@ _dbus_poll (DBusPollFD *fds,
       DBusPollFD *fdp = &fds[i]; 
 
       if (fdp->events & _DBUS_POLLIN)
-        FD_SET (fdp->fd, &read_set);
+        FD_SET (fdp->fd.sock, &read_set);
 
       if (fdp->events & _DBUS_POLLOUT)
-        FD_SET (fdp->fd, &write_set);
+        FD_SET (fdp->fd.sock, &write_set);
 
-      FD_SET (fdp->fd, &err_set);
+      FD_SET (fdp->fd.sock, &err_set);
 
-      max_fd = MAX (max_fd, fdp->fd);
+      max_fd = MAX (max_fd, fdp->fd.sock);
     }
 
   // Avoid random lockups with send(), for lack of a better solution so far
@@ -1154,14 +1397,14 @@ _dbus_poll (DBusPollFD *fds,
           {
             DBusPollFD *fdp = &fds[i];
 
-            if (FD_ISSET (fdp->fd, &read_set))
-              msgp += sprintf (msgp, "R:%d ", fdp->fd);
+            if (FD_ISSET (fdp->fd.sock, &read_set))
+              msgp += sprintf (msgp, "R:%Iu ", fdp->fd.sock);
 
-            if (FD_ISSET (fdp->fd, &write_set))
-              msgp += sprintf (msgp, "W:%d ", fdp->fd);
+            if (FD_ISSET (fdp->fd.sock, &write_set))
+              msgp += sprintf (msgp, "W:%Iu ", fdp->fd.sock);
 
-            if (FD_ISSET (fdp->fd, &err_set))
-              msgp += sprintf (msgp, "E:%d\n\t", fdp->fd);
+            if (FD_ISSET (fdp->fd.sock, &err_set))
+              msgp += sprintf (msgp, "E:%Iu\n\t", fdp->fd.sock);
           }
         msgp += sprintf (msgp, "\n");
         _dbus_verbose ("%s",msg);
@@ -1173,13 +1416,13 @@ _dbus_poll (DBusPollFD *fds,
 
             fdp->revents = 0;
 
-            if (FD_ISSET (fdp->fd, &read_set))
+            if (FD_ISSET (fdp->fd.sock, &read_set))
               fdp->revents |= _DBUS_POLLIN;
 
-            if (FD_ISSET (fdp->fd, &write_set))
+            if (FD_ISSET (fdp->fd.sock, &write_set))
               fdp->revents |= _DBUS_POLLOUT;
 
-            if (FD_ISSET (fdp->fd, &err_set))
+            if (FD_ISSET (fdp->fd.sock, &err_set))
               fdp->revents |= _DBUS_POLLERR;
           }
       }
@@ -1243,7 +1486,7 @@ _dbus_exit (int code)
  * @param error return location for error code
  * @returns connection file descriptor or -1 on error
  */
-int
+DBusSocket
 _dbus_connect_tcp_socket (const char     *host,
                           const char     *port,
                           const char     *family,
@@ -1252,20 +1495,25 @@ _dbus_connect_tcp_socket (const char     *host,
   return _dbus_connect_tcp_socket_with_nonce (host, port, family, (const char*)NULL, error);
 }
 
-int
+DBusSocket
 _dbus_connect_tcp_socket_with_nonce (const char     *host,
                                      const char     *port,
                                      const char     *family,
                                      const char     *noncefile,
                                      DBusError      *error)
 {
-  int fd = -1, res;
+  DBusSocket fd = DBUS_SOCKET_INIT;
+  int res;
   struct addrinfo hints;
   struct addrinfo *ai, *tmp;
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
-  _dbus_win_startup_winsock ();
+  if (!_dbus_win_startup_winsock ())
+    {
+      _DBUS_SET_OOM (error);
+      return _dbus_socket_get_invalid ();
+    }
 
   _DBUS_ZERO (hints);
 
@@ -1280,7 +1528,7 @@ _dbus_connect_tcp_socket_with_nonce (const char     *host,
       dbus_set_error (error,
                       DBUS_ERROR_INVALID_ARGS,
                       "Unknown address family %s", family);
-      return -1;
+      return _dbus_socket_get_invalid ();
     }
   hints.ai_protocol = IPPROTO_TCP;
   hints.ai_socktype = SOCK_STREAM;
@@ -1296,13 +1544,13 @@ _dbus_connect_tcp_socket_with_nonce (const char     *host,
                       _dbus_error_from_errno (res),
                       "Failed to lookup host/port: \"%s:%s\": %s (%d)",
                       host, port, _dbus_strerror(res), res);
-      return -1;
+      return _dbus_socket_get_invalid ();
     }
 
   tmp = ai;
   while (tmp)
     {
-      if ((fd = socket (tmp->ai_family, SOCK_STREAM, 0)) == INVALID_SOCKET)
+      if ((fd.sock = socket (tmp->ai_family, SOCK_STREAM, 0)) == INVALID_SOCKET)
         {
           DBUS_SOCKET_SET_ERRNO ();
           dbus_set_error (error,
@@ -1310,15 +1558,15 @@ _dbus_connect_tcp_socket_with_nonce (const char     *host,
                           "Failed to open socket: %s",
                           _dbus_strerror_from_errno ());
           freeaddrinfo(ai);
-          return -1;
+          return _dbus_socket_get_invalid ();
         }
       _DBUS_ASSERT_ERROR_IS_CLEAR(error);
 
-      if (connect (fd, (struct sockaddr*) tmp->ai_addr, tmp->ai_addrlen) == SOCKET_ERROR)
+      if (connect (fd.sock, (struct sockaddr*) tmp->ai_addr, tmp->ai_addrlen) == SOCKET_ERROR)
         {
           DBUS_SOCKET_SET_ERRNO ();
-          closesocket(fd);
-          fd = -1;
+          closesocket(fd.sock);
+          fd.sock = INVALID_SOCKET;
           tmp = tmp->ai_next;
           continue;
         }
@@ -1327,13 +1575,13 @@ _dbus_connect_tcp_socket_with_nonce (const char     *host,
     }
   freeaddrinfo(ai);
 
-  if (fd == -1)
+  if (!_dbus_socket_is_valid (fd))
     {
       dbus_set_error (error,
                       _dbus_error_from_errno (errno),
                       "Failed to connect to socket \"%s:%s\" %s",
                       host, port, _dbus_strerror_from_errno ());
-      return -1;
+      return _dbus_socket_get_invalid ();
     }
 
   if (noncefile != NULL)
@@ -1343,9 +1591,9 @@ _dbus_connect_tcp_socket_with_nonce (const char     *host,
       if (!_dbus_string_init (&noncefileStr) ||
           !_dbus_string_append(&noncefileStr, noncefile))
         {
-          closesocket (fd);
+          closesocket (fd.sock);
           dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
-          return -1;
+          return _dbus_socket_get_invalid ();
         }
 
       ret = _dbus_send_nonce (fd, &noncefileStr, error);
@@ -1354,17 +1602,18 @@ _dbus_connect_tcp_socket_with_nonce (const char     *host,
 
       if (!ret)
         {
-          closesocket (fd);
-          return -1;
+          closesocket (fd.sock);
+          return _dbus_socket_get_invalid ();
         }
     }
 
-  _dbus_fd_set_close_on_exec (fd);
+  /* Every SOCKET is also a HANDLE. */
+  _dbus_win_handle_set_close_on_exec ((HANDLE) fd.sock);
 
-  if (!_dbus_set_fd_nonblocking (fd, error))
+  if (!_dbus_set_socket_nonblocking (fd, error))
     {
-      closesocket (fd);
-      return -1;
+      closesocket (fd.sock);
+      return _dbus_socket_get_invalid ();
     }
 
   return fd;
@@ -1390,10 +1639,11 @@ _dbus_listen_tcp_socket (const char     *host,
                          const char     *port,
                          const char     *family,
                          DBusString     *retport,
-                         int           **fds_p,
+                         DBusSocket    **fds_p,
                          DBusError      *error)
 {
-  int nlisten_fd = 0, *listen_fd = NULL, res, i, port_num = -1;
+  DBusSocket *listen_fd = NULL;
+  int nlisten_fd = 0, res, i, port_num = -1;
   struct addrinfo hints;
   struct addrinfo *ai, *tmp;
 
@@ -1410,12 +1660,16 @@ _dbus_listen_tcp_socket (const char     *host,
   *fds_p = NULL;
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
-  _dbus_win_startup_winsock ();
+  if (!_dbus_win_startup_winsock ())
+    {
+      _DBUS_SET_OOM (error);
+      return -1;
+    }
 
   _DBUS_ZERO (hints);
 
   if (!family)
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET;
   else if (!strcmp(family, "ipv4"))
     hints.ai_family = AF_INET;
   else if (!strcmp(family, "ipv6"))
@@ -1449,8 +1703,8 @@ _dbus_listen_tcp_socket (const char     *host,
   tmp = ai;
   while (tmp)
     {
-      int fd = -1, *newlisten_fd;
-      if ((fd = socket (tmp->ai_family, SOCK_STREAM, 0)) == INVALID_SOCKET)
+      DBusSocket fd = DBUS_SOCKET_INIT, *newlisten_fd;
+      if ((fd.sock = socket (tmp->ai_family, SOCK_STREAM, 0)) == INVALID_SOCKET)
         {
           DBUS_SOCKET_SET_ERRNO ();
           dbus_set_error (error,
@@ -1461,30 +1715,39 @@ _dbus_listen_tcp_socket (const char     *host,
         }
       _DBUS_ASSERT_ERROR_IS_CLEAR(error);
 
-      if (bind (fd, (struct sockaddr*) tmp->ai_addr, tmp->ai_addrlen) == SOCKET_ERROR)
+      if (bind (fd.sock, (struct sockaddr*) tmp->ai_addr, tmp->ai_addrlen) == SOCKET_ERROR)
         {
           DBUS_SOCKET_SET_ERRNO ();
+          closesocket (fd.sock);
+          if (errno == WSAEADDRINUSE)
+          {
+              /* Calling this function with port=0 tries to
+               * bind the same port twice, so we should
+               * ignore the second bind.
+               */
+              tmp = tmp->ai_next;
+              continue;
+          }
           dbus_set_error (error, _dbus_error_from_errno (errno),
                           "Failed to bind socket \"%s:%s\": %s",
                           host ? host : "*", port, _dbus_strerror_from_errno ());
-          closesocket (fd);
           goto failed;
     }
 
-      if (listen (fd, 30 /* backlog */) == SOCKET_ERROR)
+      if (listen (fd.sock, 30 /* backlog */) == SOCKET_ERROR)
         {
           DBUS_SOCKET_SET_ERRNO ();
           dbus_set_error (error, _dbus_error_from_errno (errno),
                           "Failed to listen on socket \"%s:%s\": %s",
                           host ? host : "*", port, _dbus_strerror_from_errno ());
-          closesocket (fd);
+          closesocket (fd.sock);
           goto failed;
         }
 
-      newlisten_fd = dbus_realloc(listen_fd, sizeof(int)*(nlisten_fd+1));
+      newlisten_fd = dbus_realloc(listen_fd, sizeof(DBusSocket)*(nlisten_fd+1));
       if (!newlisten_fd)
         {
-          closesocket (fd);
+          closesocket (fd.sock);
           dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
                           "Failed to allocate file handle array");
           goto failed;
@@ -1503,9 +1766,12 @@ _dbus_listen_tcp_socket (const char     *host,
             {
               mysockaddr_gen addr;
               socklen_t addrlen = sizeof(addr);
-              char portbuf[10];
+              char portbuf[NI_MAXSERV];
 
-              if (getsockname(fd, &addr.Address, &addrlen) == SOCKET_ERROR)
+              if (getsockname(fd.sock, &addr.Address, &addrlen) == SOCKET_ERROR ||
+                (res = getnameinfo (&addr.Address, addrlen, NULL, 0,
+                                    portbuf, sizeof(portbuf),
+                                    NI_NUMERICSERV)) != 0)
                 {
                   DBUS_SOCKET_SET_ERRNO ();
                   dbus_set_error (error, _dbus_error_from_errno (errno),
@@ -1513,7 +1779,6 @@ _dbus_listen_tcp_socket (const char     *host,
                                   host ? host : "*", port, _dbus_strerror_from_errno());
                   goto failed;
                 }
-              snprintf( portbuf, sizeof( portbuf ) - 1, "%d", addr.AddressIn.sin_port );
               if (!_dbus_string_append(retport, portbuf))
                 {
                   dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
@@ -1553,8 +1818,8 @@ _dbus_listen_tcp_socket (const char     *host,
 
   for (i = 0 ; i < nlisten_fd ; i++)
     {
-      _dbus_fd_set_close_on_exec (listen_fd[i]);
-      if (!_dbus_set_fd_nonblocking (listen_fd[i], error))
+      _dbus_win_handle_set_close_on_exec ((HANDLE) listen_fd[i].sock);
+      if (!_dbus_set_socket_nonblocking (listen_fd[i], error))
         {
           goto failed;
         }
@@ -1568,7 +1833,7 @@ _dbus_listen_tcp_socket (const char     *host,
   if (ai)
     freeaddrinfo(ai);
   for (i = 0 ; i < nlisten_fd ; i++)
-    closesocket (listen_fd[i]);
+    closesocket (listen_fd[i].sock);
   dbus_free(listen_fd);
   return -1;
 }
@@ -1581,22 +1846,22 @@ _dbus_listen_tcp_socket (const char     *host,
  * @param listen_fd the listen file descriptor
  * @returns the connection fd of the client, or -1 on error
  */
-int
-_dbus_accept  (int listen_fd)
+DBusSocket
+_dbus_accept  (DBusSocket listen_fd)
 {
-  int client_fd;
+  DBusSocket client_fd;
 
  retry:
-  client_fd = accept (listen_fd, NULL, NULL);
+  client_fd.sock = accept (listen_fd.sock, NULL, NULL);
 
-  if (DBUS_SOCKET_IS_INVALID (client_fd))
+  if (!_dbus_socket_is_valid (client_fd))
     {
       DBUS_SOCKET_SET_ERRNO ();
       if (errno == EINTR)
         goto retry;
     }
 
-  _dbus_verbose ("client fd %d accepted\n", client_fd);
+  _dbus_verbose ("client fd %Iu accepted\n", client_fd.sock);
   
   return client_fd;
 }
@@ -1605,8 +1870,8 @@ _dbus_accept  (int listen_fd)
 
 
 dbus_bool_t
-_dbus_send_credentials_socket (int            handle,
-                        DBusError      *error)
+_dbus_send_credentials_socket (DBusSocket      handle,
+                               DBusError      *error)
 {
 /* FIXME: for the session bus credentials shouldn't matter (?), but
  * for the system bus they are presumably essential. A rough outline
@@ -1670,40 +1935,59 @@ again:
  * a byte was read, not whether we got valid credentials. On some
  * systems, such as Linux, reading/writing the byte isn't actually
  * required, but we do it anyway just to avoid multiple codepaths.
- * 
+ *
  * Fails if no byte is available, so you must select() first.
  *
  * The point of the byte is that on some systems we have to
  * use sendmsg()/recvmsg() to transmit credentials.
  *
- * @param client_fd the client file descriptor
+ * @param handle the client file descriptor
  * @param credentials struct to fill with credentials of client
  * @param error location to store error code
  * @returns #TRUE on success
  */
 dbus_bool_t
-_dbus_read_credentials_socket  (int              handle,
+_dbus_read_credentials_socket  (DBusSocket       handle,
                                 DBusCredentials *credentials,
                                 DBusError       *error)
 {
   int bytes_read = 0;
   DBusString buf;
-  
+
+  char *sid = NULL;
+  dbus_pid_t pid;
+  int retval = FALSE;
+
   // could fail due too OOM
-  if (_dbus_string_init(&buf))
+  if (_dbus_string_init (&buf))
     {
-      bytes_read = _dbus_read_socket(handle, &buf, 1 );
+      bytes_read = _dbus_read_socket (handle, &buf, 1 );
 
       if (bytes_read > 0) 
-        _dbus_verbose("got one zero byte from server");
+        _dbus_verbose ("got one zero byte from server\n");
 
-      _dbus_string_free(&buf);
+      _dbus_string_free (&buf);
     }
 
-  _dbus_credentials_add_from_current_process (credentials);
-  _dbus_verbose("FIXME: get faked credentials from current process");
+  pid = _dbus_get_peer_pid_from_tcp_handle (handle.sock);
+  if (pid == 0)
+    return TRUE;
 
-  return TRUE;
+  _dbus_credentials_add_pid (credentials, pid);
+
+  if (_dbus_getsid (&sid, pid))
+    {
+      if (!_dbus_credentials_add_windows_sid (credentials, sid))
+        goto out;
+    }
+
+  retval = TRUE;
+
+out:
+  if (sid)
+    LocalFree (sid);
+
+  return retval;
 }
 
 /**
@@ -1797,10 +2081,10 @@ _dbus_credentials_add_from_current_process (DBusCredentials *credentials)
   dbus_bool_t retval = FALSE;
   char *sid = NULL;
 
-  if (!_dbus_getsid(&sid))
+  if (!_dbus_getsid(&sid, _dbus_getpid()))
     goto failed;
 
-  if (!_dbus_credentials_add_unix_pid(credentials, _dbus_getpid()))
+  if (!_dbus_credentials_add_pid (credentials, _dbus_getpid()))
     goto failed;
 
   if (!_dbus_credentials_add_windows_sid (credentials,sid))
@@ -1835,7 +2119,7 @@ _dbus_append_user_from_current_process (DBusString *str)
   dbus_bool_t retval = FALSE;
   char *sid = NULL;
 
-  if (!_dbus_getsid(&sid))
+  if (!_dbus_getsid(&sid, _dbus_getpid()))
     return FALSE;
 
   retval = _dbus_string_append (str,sid);
@@ -1852,6 +2136,15 @@ dbus_pid_t
 _dbus_getpid (void)
 {
   return GetCurrentProcessId ();
+}
+
+/** Gets our Unix UID
+ * @returns on Windows, just DBUS_UID_UNSET
+ */
+dbus_uid_t
+_dbus_getuid (void)
+{
+  return DBUS_UID_UNSET;
 }
 
 /** nanoseconds in a second */
@@ -1931,6 +2224,35 @@ _dbus_disable_sigpipe (void)
 }
 
 /**
+ * Creates a directory. Unlike _dbus_ensure_directory(), this only succeeds
+ * if the directory is genuinely newly-created.
+ *
+ * @param filename directory filename
+ * @param error initialized error object
+ * @returns #TRUE on success
+ */
+dbus_bool_t
+_dbus_create_directory (const DBusString *filename,
+                        DBusError        *error)
+{
+  const char *filename_c;
+
+  _DBUS_ASSERT_ERROR_IS_CLEAR (error);
+
+  filename_c = _dbus_string_get_const_data (filename);
+
+  if (!CreateDirectoryA (filename_c, NULL))
+    {
+      dbus_set_error (error, DBUS_ERROR_FAILED,
+                      "Failed to create directory %s: %s\n",
+                      filename_c, _dbus_strerror_from_errno ());
+      return FALSE;
+    }
+  else
+    return TRUE;
+}
+
+/**
  * Creates a directory; succeeds if the directory
  * is created or already existed.
  *
@@ -1939,7 +2261,7 @@ _dbus_disable_sigpipe (void)
  * @returns #TRUE on success
  */
 dbus_bool_t
-_dbus_create_directory (const DBusString *filename,
+_dbus_ensure_directory (const DBusString *filename,
                         DBusError        *error)
 {
   const char *filename_c;
@@ -1969,11 +2291,13 @@ _dbus_create_directory (const DBusString *filename,
  *
  * @param str the string
  * @param n_bytes the number of random bytes to append to string
- * @returns #TRUE on success, #FALSE if no memory
+ * @param error location to store reason for failure
+ * @returns #TRUE on success
  */
 dbus_bool_t
 _dbus_generate_random_bytes (DBusString *str,
-                             int         n_bytes)
+                             int         n_bytes,
+                             DBusError  *error)
 {
   int old_len;
   char *p;
@@ -1982,15 +2306,22 @@ _dbus_generate_random_bytes (DBusString *str,
   old_len = _dbus_string_get_length (str);
 
   if (!_dbus_string_lengthen (str, n_bytes))
-    return FALSE;
+    {
+      _DBUS_SET_OOM (error);
+      return FALSE;
+    }
 
   p = _dbus_string_get_data_len (str, old_len, n_bytes);
 
   if (!CryptAcquireContext (&hprov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
-    return FALSE;
+    {
+      _DBUS_SET_OOM (error);
+      return FALSE;
+    }
 
   if (!CryptGenRandom (hprov, n_bytes, p))
     {
+      _DBUS_SET_OOM (error);
       CryptReleaseContext (hprov, 0);
       return FALSE;
     }
@@ -2004,13 +2335,17 @@ _dbus_generate_random_bytes (DBusString *str,
  * Gets the temporary files directory by inspecting the environment variables 
  * TMPDIR, TMP, and TEMP in that order. If none of those are set "/tmp" is returned
  *
- * @returns location of temp directory
+ * @returns location of temp directory, or #NULL if no memory for locking
  */
 const char*
 _dbus_get_tmpdir(void)
 {
+  /* Protected by _DBUS_LOCK_sysdeps */
   static const char* tmpdir = NULL;
   static char buf[1000];
+
+  if (!_DBUS_LOCK (sysdeps))
+    return NULL;
 
   if (tmpdir == NULL)
     {
@@ -2032,6 +2367,8 @@ _dbus_get_tmpdir(void)
 
       tmpdir = buf;
     }
+
+  _DBUS_UNLOCK (sysdeps);
 
   _dbus_assert(tmpdir != NULL);
 
@@ -2068,51 +2405,7 @@ _dbus_delete_file (const DBusString *filename,
     return TRUE;
 }
 
-/*
- * replaces the term DBUS_PREFIX in configure_time_path by the
- * current dbus installation directory. On unix this function is a noop
- *
- * @param configure_time_path
- * @return real path
- */
-const char *
-_dbus_replace_install_prefix (const char *configure_time_path)
-{
-#ifndef DBUS_PREFIX
-  return configure_time_path;
-#else
-  static char retval[1000];
-  static char runtime_prefix[1000];
-  int len = 1000;
-  int i;
-
-  if (!configure_time_path)
-    return NULL;
-
-  if ((!_dbus_get_install_root(runtime_prefix, len) ||
-       strncmp (configure_time_path, DBUS_PREFIX "/",
-                strlen (DBUS_PREFIX) + 1))) {
-     strcat (retval, configure_time_path);
-     return retval;
-  }
-
-  strcpy (retval, runtime_prefix);
-  strcat (retval, configure_time_path + strlen (DBUS_PREFIX) + 1);
-
-  /* Somehow, in some situations, backslashes get collapsed in the string.
-   * Since windows C library accepts both forward and backslashes as
-   * path separators, convert all backslashes to forward slashes.
-   */
-
-  for(i = 0; retval[i] != '\0'; i++) {
-    if(retval[i] == '\\')
-      retval[i] = '/';
-  }
-  return retval;
-#endif
-}
-
-#if !defined (DBUS_DISABLE_ASSERTS) || defined(DBUS_BUILD_TESTS)
+#if !defined (DBUS_DISABLE_ASSERT) || defined(DBUS_ENABLE_EMBEDDED_TESTS)
 
 #if defined(_MSC_VER) || defined(DBUS_WINCE)
 # ifdef BACKTRACES
@@ -2148,7 +2441,7 @@ _dbus_replace_install_prefix (const char *configure_time_path)
 #include <imagehlp.h>
 #include <stdio.h>
 
-#define DPRINTF _dbus_warn
+#define DPRINTF(fmt, ...) fprintf (stderr, fmt, ##__VA_ARGS__)
 
 #ifdef _MSC_VER
 #define BOOL int
@@ -2680,6 +2973,7 @@ _dbus_daemon_publish_session_bus_address (const char* address, const char *scope
   char *shared_addr = NULL;
   DBusString shm_name;
   DBusString mutex_name;
+  dbus_uint64_t len;
 
   _dbus_assert (address);
 
@@ -2714,8 +3008,11 @@ _dbus_daemon_publish_session_bus_address (const char* address, const char *scope
     }
 
   // create shm
+  len = strlen (address) + 1;
+
   hDBusSharedMem = CreateFileMappingA( INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
-                                       0, strlen( address ) + 1, _dbus_string_get_const_data(&shm_name) );
+                                       len >> 32, len & 0xffffffffu,
+                                       _dbus_string_get_const_data(&shm_name) );
   _dbus_assert( hDBusSharedMem );
 
   shared_addr = MapViewOfFile( hDBusSharedMem, FILE_MAP_WRITE, 0, 0, 0 );
@@ -2859,8 +3156,8 @@ _dbus_get_autolaunch_address (const char *scope, DBusString *address,
 
   if (_dbus_daemon_already_runs(address,&shm_name,scope))
     {
-        _dbus_verbose( "found running dbus daemon at %s\n",
-                       _dbus_string_get_const_data (&shm_name) );
+        _dbus_verbose( "found running dbus daemon for scope '%s' at %s\n",
+                       scope ? scope : "", _dbus_string_get_const_data (&shm_name) );
         retval = TRUE;
         goto out;
     }
@@ -2931,6 +3228,7 @@ out:
     _DBUS_ASSERT_ERROR_IS_SET (error);
   
   _dbus_global_unlock (mutex);
+  _dbus_string_free (&shm_name);
 
   return retval;
  }
@@ -2949,142 +3247,6 @@ _dbus_make_file_world_readable(const DBusString *filename,
   // TODO
   return TRUE;
 }
-
-/**
- * return the relocated DATADIR
- *
- * @returns relocated DATADIR static string
- */
-
-static const char *
-_dbus_windows_get_datadir (void)
-{
-	return _dbus_replace_install_prefix(DBUS_DATADIR);
-}
-
-#undef DBUS_DATADIR
-#define DBUS_DATADIR _dbus_windows_get_datadir ()
-
-
-#define DBUS_STANDARD_SESSION_SERVICEDIR "/dbus-1/services"
-#define DBUS_STANDARD_SYSTEM_SERVICEDIR "/dbus-1/system-services"
-
-/**
- * Returns the standard directories for a session bus to look for service 
- * activation files 
- *
- * On Windows this should be data directories:
- *
- * %CommonProgramFiles%/dbus
- *
- * and
- *
- * relocated DBUS_DATADIR
- *
- * @param dirs the directory list we are returning
- * @returns #FALSE on OOM 
- */
-
-dbus_bool_t 
-_dbus_get_standard_session_servicedirs (DBusList **dirs)
-{
-  const char *common_progs;
-  DBusString servicedir_path;
-
-  if (!_dbus_string_init (&servicedir_path))
-    return FALSE;
-
-#ifdef DBUS_WINCE
-  {
-    /* On Windows CE, we adjust datadir dynamically to installation location.  */
-    const char *data_dir = _dbus_getenv ("DBUS_DATADIR");
-
-    if (data_dir != NULL)
-      {
-        if (!_dbus_string_append (&servicedir_path, data_dir))
-          goto oom;
-        
-        if (!_dbus_string_append (&servicedir_path, _DBUS_PATH_SEPARATOR))
-          goto oom;
-      }
-  }
-#else
-/*
- the code for accessing services requires absolute base pathes
- in case DBUS_DATADIR is relative make it absolute
-*/
-#ifdef DBUS_WIN
-  {
-    DBusString p;
-
-    _dbus_string_init_const (&p, DBUS_DATADIR);
-
-    if (!_dbus_path_is_absolute (&p))
-      {
-        char install_root[1000];
-        if (_dbus_get_install_root (install_root, sizeof(install_root)))
-          if (!_dbus_string_append (&servicedir_path, install_root))
-            goto oom;
-      }
-  }
-#endif
-  if (!_dbus_string_append (&servicedir_path, DBUS_DATADIR))
-    goto oom;
-
-  if (!_dbus_string_append (&servicedir_path, _DBUS_PATH_SEPARATOR))
-    goto oom;
-#endif
-
-  common_progs = _dbus_getenv ("CommonProgramFiles");
-
-  if (common_progs != NULL)
-    {
-      if (!_dbus_string_append (&servicedir_path, common_progs))
-        goto oom;
-
-      if (!_dbus_string_append (&servicedir_path, _DBUS_PATH_SEPARATOR))
-        goto oom;
-    }
-
-  if (!_dbus_split_paths_and_append (&servicedir_path, 
-                               DBUS_STANDARD_SESSION_SERVICEDIR, 
-                               dirs))
-    goto oom;
-
-  _dbus_string_free (&servicedir_path);  
-  return TRUE;
-
- oom:
-  _dbus_string_free (&servicedir_path);
-  return FALSE;
-}
-
-/**
- * Returns the standard directories for a system bus to look for service
- * activation files
- *
- * On UNIX this should be the standard xdg freedesktop.org data directories:
- *
- * XDG_DATA_DIRS=${XDG_DATA_DIRS-/usr/local/share:/usr/share}
- *
- * and
- *
- * DBUS_DATADIR
- *
- * On Windows there is no system bus and this function can return nothing.
- *
- * @param dirs the directory list we are returning
- * @returns #FALSE on OOM
- */
-
-dbus_bool_t
-_dbus_get_standard_system_servicedirs (DBusList **dirs)
-{
-  *dirs = NULL;
-  return TRUE;
-}
-
-_DBUS_DEFINE_GLOBAL_LOCK (atomic);
 
 /**
  * Atomically increments an integer
@@ -3126,8 +3288,18 @@ _dbus_atomic_dec (DBusAtomic *atomic)
 dbus_int32_t
 _dbus_atomic_get (DBusAtomic *atomic)
 {
-  /* this is what GLib does, hopefully it's right... */
-  MemoryBarrier ();
+  /* In this situation, GLib issues a MemoryBarrier() and then returns
+   * atomic->value. However, mingw from mingw.org (not to be confused with
+   * mingw-w64 from mingw-w64.sf.net) does not have MemoryBarrier in its
+   * headers, so we have to get a memory barrier some other way.
+   *
+   * InterlockedIncrement is older, and is documented on MSDN to be a full
+   * memory barrier, so let's use that.
+   */
+  long dummy = 0;
+
+  InterlockedExchange (&dummy, 1);
+
   return atomic->value;
 }
 
@@ -3147,18 +3319,18 @@ _dbus_flush_caches (void)
  * See if errno is EAGAIN or EWOULDBLOCK (this has to be done differently
  * for Winsock so is abstracted)
  *
- * @returns #TRUE if errno == EAGAIN or errno == EWOULDBLOCK
+ * @returns #TRUE if e == EAGAIN or e == EWOULDBLOCK
  */
 dbus_bool_t
-_dbus_get_is_errno_eagain_or_ewouldblock (void)
+_dbus_get_is_errno_eagain_or_ewouldblock (int e)
 {
-  return errno == WSAEWOULDBLOCK;
+  return e == WSAEWOULDBLOCK;
 }
 
 /**
  * return the absolute path of the dbus installation 
  *
- * @param s buffer for installation path
+ * @param prefix buffer for installation path
  * @param len length of buffer
  * @returns #FALSE on failure
  */
@@ -3196,97 +3368,6 @@ _dbus_get_install_root(char *prefix, int len)
         lastSlash[-11] = 0;
 
     return TRUE;
-}
-
-/** 
-  find config file either from installation or build root according to 
-  the following path layout 
-    install-root/
-      bin/dbus-daemon[d].exe
-      etc/<config-file>.conf *or* etc/dbus-1/<config-file>.conf
-      (the former above is what dbus4win uses, the latter above is
-      what a "normal" Unix-style "make install" uses)
-
-    build-root/
-      bin/dbus-daemon[d].exe
-      bus/<config-file>.conf 
-*/
-dbus_bool_t 
-_dbus_get_config_file_name(DBusString *config_file, char *s)
-{
-  char path[MAX_PATH*2];
-  int path_size = sizeof(path);
-
-  if (!_dbus_get_install_root(path,path_size))
-    return FALSE;
-
-  if(strlen(s) + 4 + strlen(path) > sizeof(path)-2)
-    return FALSE;
-  strcat(path,"etc\\");
-  strcat(path,s);
-  if (_dbus_file_exists(path)) 
-    {
-      // find path from executable 
-      if (!_dbus_string_append (config_file, path))
-        return FALSE;
-    }
-  else 
-    {
-      if (!_dbus_get_install_root(path,path_size))
-        return FALSE;
-      if(strlen(s) + 11 + strlen(path) > sizeof(path)-2)
-        return FALSE;
-      strcat(path,"etc\\dbus-1\\");
-      strcat(path,s);
-  
-      if (_dbus_file_exists(path)) 
-        {
-          if (!_dbus_string_append (config_file, path))
-            return FALSE;
-        }
-      else
-        {
-          if (!_dbus_get_install_root(path,path_size))
-            return FALSE;
-          if(strlen(s) + 4 + strlen(path) > sizeof(path)-2)
-            return FALSE;
-          strcat(path,"bus\\");
-          strcat(path,s);
-          
-          if (_dbus_file_exists(path)) 
-            {
-              if (!_dbus_string_append (config_file, path))
-                return FALSE;
-            }
-        }
-    }
-  return TRUE;
-}    
-
-/**
- * Append the absolute path of the system.conf file
- * (there is no system bus on Windows so this can just
- * return FALSE and print a warning or something)
- * 
- * @param str the string to append to
- * @returns #FALSE if no memory
- */
-dbus_bool_t
-_dbus_append_system_config_file (DBusString *str)
-{
-  return _dbus_get_config_file_name(str, "system.conf");
-}
-
-/**
- * Append the absolute path of the session.conf file.
- * 
- * @param str the string to append to
- * @returns #FALSE if no memory
- */
-dbus_bool_t
-_dbus_append_session_config_file (DBusString *str)
-{
-  return _dbus_get_config_file_name(str, "session.conf");
 }
 
 /* See comment in dbus-sysdeps-unix.c */
@@ -3340,7 +3421,7 @@ _dbus_append_keyring_directory_for_credentials (DBusString      *directory,
       _dbus_string_append(&homedir,homepath);
     }
   
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
   {
     const char *override;
     
@@ -3356,6 +3437,8 @@ _dbus_append_keyring_directory_for_credentials (DBusString      *directory,
       }
     else
       {
+        /* Not strictly thread-safe, but if we fail at thread-safety here,
+         * the worst that will happen is some extra warnings. */
         static dbus_bool_t already_warned = FALSE;
         if (!already_warned)
           {
@@ -3566,13 +3649,8 @@ _dbus_win_set_error_from_win_error (DBusError *error,
                   (LPSTR) &msg, 0, NULL);
   if (msg)
     {
-      char *msg_copy;
-
-      msg_copy = dbus_malloc (strlen (msg));
-      strcpy (msg_copy, msg);
+      dbus_set_error (error, "win32.error", "%s", msg);
       LocalFree (msg);
-
-      dbus_set_error (error, "win32.error", "%s", msg_copy);
     }
   else
     dbus_set_error (error, "win32.error", "Unknown error code %d or FormatMessage failed", code);
@@ -3580,7 +3658,7 @@ _dbus_win_set_error_from_win_error (DBusError *error,
 
 void
 _dbus_win_warn_win_error (const char *message,
-                          int         code)
+                          unsigned long code)
 {
   DBusError error;
 
@@ -3641,6 +3719,18 @@ dbus_bool_t
 _dbus_check_setuid (void)
 {
   return FALSE;
+}
+
+int
+_dbus_save_socket_errno (void)
+{
+  return errno;
+}
+
+void
+_dbus_restore_socket_errno (int saved_errno)
+{
+  _dbus_win_set_errno (saved_errno);
 }
 
 /** @} end of sysdeps-win */

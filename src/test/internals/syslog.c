@@ -30,9 +30,10 @@
 
 #include <glib.h>
 
-#define DBUS_COMPILATION    /* this test uses libdbus-internal */
 #include <dbus/dbus.h>
 #include <dbus/dbus-sysdeps.h>
+
+#include "test-utils-glib.h"
 
 typedef struct {
     int dummy;
@@ -52,9 +53,10 @@ static void
 test_syslog (Fixture *f,
     gconstpointer data)
 {
+#ifndef G_OS_WIN32
   if (g_test_trap_fork (0, 0))
     {
-      _dbus_init_system_log ();
+      _dbus_init_system_log (FALSE);
       _dbus_system_log (DBUS_SYSTEM_LOG_FATAL, MESSAGE "%d", 23);
       /* should not be reached: exit 0 so the assertion in the main process
        * will fail */
@@ -66,18 +68,20 @@ test_syslog (Fixture *f,
 
   if (g_test_trap_fork (0, 0))
     {
-      _dbus_init_system_log ();
+      _dbus_init_system_log (FALSE);
       _dbus_system_log (DBUS_SYSTEM_LOG_INFO, MESSAGE "%d", 42);
+      _dbus_system_log (DBUS_SYSTEM_LOG_WARNING, MESSAGE "%d", 45);
       _dbus_system_log (DBUS_SYSTEM_LOG_SECURITY, MESSAGE "%d", 666);
       exit (0);
     }
 
   g_test_trap_assert_passed ();
-  g_test_trap_assert_stderr ("*" MESSAGE "42\n*" MESSAGE "666\n*");
-
+  g_test_trap_assert_stderr ("*" MESSAGE "42\n*" MESSAGE "45\n*" MESSAGE "666\n*");
+#endif
   /* manual test (this is the best we can do on Windows) */
-  _dbus_init_system_log ();
+  _dbus_init_system_log (FALSE);
   _dbus_system_log (DBUS_SYSTEM_LOG_INFO, MESSAGE "%d", 42);
+  _dbus_system_log (DBUS_SYSTEM_LOG_WARNING, MESSAGE "%d", 45);
   _dbus_system_log (DBUS_SYSTEM_LOG_SECURITY, MESSAGE "%d", 666);
 }
 
@@ -91,8 +95,7 @@ int
 main (int argc,
     char **argv)
 {
-  g_test_init (&argc, &argv, NULL);
-  g_test_bug_base ("https://bugs.freedesktop.org/show_bug.cgi?id=");
+  test_init (&argc, &argv);
 
   g_test_add ("/syslog", Fixture, NULL, setup, test_syslog, teardown);
 

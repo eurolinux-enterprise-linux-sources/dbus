@@ -1,0 +1,28 @@
+From 8e3c46c33f32290bc2f205de62a7d9ba01994f72 Mon Sep 17 00:00:00 2001
+From: David King <dking@redhat.com>
+Date: Wed, 7 Feb 2018 14:37:24 +0000
+Subject: [PATCH] bus: raise fd limits before dropping privs
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1529044
+---
+ bus/bus.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/bus/bus.c b/bus/bus.c
+index a6f8db47..4b922a89 100644
+--- a/bus/bus.c
++++ b/bus/bus.c
+@@ -940,6 +940,11 @@ bus_context_new (const DBusString *confi
+    */
+   if (context->user != NULL)
+     {
++      /* Raise the file descriptor limits before dropping the privileges
++       * required to do so.
++       */
++      raise_file_descriptor_limit (context);
++
+       if (!_dbus_change_to_daemon_user (context->user, error))
+ 	{
+ 	  _DBUS_ASSERT_ERROR_IS_SET (error);
+-- 
+2.14.3

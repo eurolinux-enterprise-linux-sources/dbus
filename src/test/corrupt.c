@@ -30,10 +30,12 @@
 #include <gio/gio.h>
 
 #include <dbus/dbus.h>
-#include <dbus/dbus-glib-lowlevel.h>
+
+#include "test-utils-glib.h"
 
 typedef struct {
     DBusError e;
+    TestMainContext *ctx;
 
     DBusServer *server;
     DBusConnection *server_conn;
@@ -72,13 +74,14 @@ new_conn_cb (DBusServer *server,
 
   g_assert (f->server_conn == NULL);
   f->server_conn = dbus_connection_ref (server_conn);
-  dbus_connection_setup_with_g_main (server_conn, NULL);
+  test_connection_setup (f->ctx, server_conn);
 }
 
 static void
 setup (Fixture *f,
     gconstpointer addr)
 {
+  f->ctx = test_main_context_get ();
   dbus_error_init (&f->e);
   g_queue_init (&f->client_messages);
 
@@ -88,7 +91,7 @@ setup (Fixture *f,
 
   dbus_server_set_new_connection_function (f->server,
       new_conn_cb, f, NULL);
-  dbus_server_setup_with_g_main (f->server, NULL);
+  test_server_setup (f->ctx, f->server);
 }
 
 static void
@@ -96,19 +99,21 @@ test_connect (Fixture *f,
     gconstpointer addr G_GNUC_UNUSED)
 {
   dbus_bool_t have_mem;
+  char *address = NULL;
 
   g_assert (f->server_conn == NULL);
 
-  f->client_conn = dbus_connection_open_private (
-      dbus_server_get_address (f->server), &f->e);
+  address = dbus_server_get_address (f->server);
+  f->client_conn = dbus_connection_open_private (address, &f->e);
   assert_no_error (&f->e);
   g_assert (f->client_conn != NULL);
-  dbus_connection_setup_with_g_main (f->client_conn, NULL);
+  test_connection_setup (f->ctx, f->client_conn);
+  dbus_free (address);
 
   while (f->server_conn == NULL)
     {
-      g_print (".");
-      g_main_context_iteration (NULL, TRUE);
+      test_progress ('.');
+      test_main_context_iterate (f->ctx, TRUE);
     }
 
   have_mem = dbus_connection_add_filter (f->client_conn,
@@ -136,8 +141,8 @@ test_message (Fixture *f,
 
   while (g_queue_is_empty (&f->client_messages))
     {
-      g_print (".");
-      g_main_context_iteration (NULL, TRUE);
+      test_progress ('.');
+      test_main_context_iterate (f->ctx, TRUE);
     }
 
   g_assert_cmpuint (g_queue_get_length (&f->client_messages), ==, 1);
@@ -228,8 +233,8 @@ test_corrupt (Fixture *f,
    * rubbish, so it should disconnect */
   while (g_queue_is_empty (&f->client_messages))
     {
-      g_print (".");
-      g_main_context_iteration (NULL, TRUE);
+      test_progress ('.');
+      test_main_context_iterate (f->ctx, TRUE);
     }
 
   incoming = g_queue_pop_head (&f->client_messages);
@@ -246,6 +251,16 @@ test_corrupt (Fixture *f,
       "/org/freedesktop/DBus/Local");
 
   dbus_message_unref (incoming);
+
+  /* Free the DBusConnection before the GSocket, because GSocket is
+   * going to close our fd. GSocket tolerates closing an already-closed
+   * fd, whereas DBusLoop + DBusSocketSetEpoll doesn't. On Unix
+   * we could use dup() but that isn't portable to Windows :-(
+   */
+  dbus_connection_close (f->server_conn);
+  dbus_connection_unref (f->server_conn);
+  f->server_conn = NULL;
+
   g_object_unref (socket);
 }
 
@@ -258,7 +273,6 @@ test_byte_order (Fixture *f,
   int fd;
   char *blob;
   const gchar *arg = not_a_dbus_message;
-  const gchar * const *args = &arg;
   int blob_len;
   DBusMessage *message;
   dbus_bool_t mem;
@@ -270,7 +284,7 @@ test_byte_order (Fixture *f,
   /* Append 0xFF bytes, so that the length of the body when byte-swapped
    * is 0xFF000000, which is invalid */
   mem = dbus_message_append_args (message,
-      DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &args, 0xFF,
+      DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &arg, 0xFF,
       DBUS_TYPE_INVALID);
   g_assert (mem);
   mem = dbus_message_marshal (message, &blob, &blob_len);
@@ -307,8 +321,8 @@ test_byte_order (Fixture *f,
    * message, so it should disconnect */
   while (g_queue_is_empty (&f->client_messages))
     {
-      g_print (".");
-      g_main_context_iteration (NULL, TRUE);
+      test_progress ('.');
+      test_main_context_iterate (f->ctx, TRUE);
     }
 
   message = g_queue_pop_head (&f->client_messages);
@@ -325,6 +339,12 @@ test_byte_order (Fixture *f,
       "/org/freedesktop/DBus/Local");
 
   dbus_message_unref (message);
+
+  /* Free the DBusConnection before the GSocket, as above. */
+  dbus_connection_close (f->server_conn);
+  dbus_connection_unref (f->server_conn);
+  f->server_conn = NULL;
+
   g_object_unref (socket);
 }
 
@@ -334,6 +354,7 @@ teardown (Fixture *f,
 {
   if (f->client_conn != NULL)
     {
+      test_connection_shutdown (f->ctx, f->client_conn);
       dbus_connection_close (f->client_conn);
       dbus_connection_unref (f->client_conn);
       f->client_conn = NULL;
@@ -341,6 +362,7 @@ teardown (Fixture *f,
 
   if (f->server_conn != NULL)
     {
+      test_connection_shutdown (f->ctx, f->server_conn);
       dbus_connection_close (f->server_conn);
       dbus_connection_unref (f->server_conn);
       f->server_conn = NULL;
@@ -352,14 +374,15 @@ teardown (Fixture *f,
       dbus_server_unref (f->server);
       f->server = NULL;
     }
+
+  test_main_context_unref (f->ctx);
 }
 
 int
 main (int argc,
     char **argv)
 {
-  g_test_init (&argc, &argv, NULL);
-  g_type_init ();
+  test_init (&argc, &argv);
 
   g_test_add ("/corrupt/tcp", Fixture, "tcp:host=127.0.0.1", setup,
       test_corrupt, teardown);

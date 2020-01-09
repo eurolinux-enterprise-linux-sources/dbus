@@ -98,9 +98,10 @@ cdata_new (DBusLoop       *loop,
 }
 
 dbus_bool_t
-test_connection_setup (DBusLoop       *loop,
+test_connection_setup (TestMainContext *ctx,
                        DBusConnection *connection)
 {
+  DBusLoop *loop = ctx;
   CData *cd;
 
   cd = NULL;
@@ -150,8 +151,15 @@ test_connection_setup (DBusLoop       *loop,
   return FALSE;
 }
 
+static void
+die (const char *message)
+{
+  fprintf (stderr, "*** %s", message);
+  exit (1);
+}
+
 void
-test_connection_shutdown (DBusLoop       *loop,
+test_connection_shutdown (TestMainContext *ctx,
                           DBusConnection *connection)
 {
   if (!dbus_connection_set_watch_functions (connection,
@@ -159,14 +167,14 @@ test_connection_shutdown (DBusLoop       *loop,
                                             NULL,
                                             NULL,
                                             NULL, NULL))
-    _dbus_assert_not_reached ("setting watch functions to NULL failed");
+    die ("setting watch functions to NULL failed");
   
   if (!dbus_connection_set_timeout_functions (connection,
                                               NULL,
                                               NULL,
                                               NULL,
                                               NULL, NULL))
-    _dbus_assert_not_reached ("setting timeout functions to NULL failed");
+    die ("setting timeout functions to NULL failed");
 
   dbus_connection_set_dispatch_status_function (connection, NULL, NULL, NULL);
 }
@@ -253,9 +261,10 @@ remove_server_timeout (DBusTimeout *timeout,
 }
 
 dbus_bool_t
-test_server_setup (DBusLoop      *loop,
+test_server_setup (TestMainContext *ctx,
                    DBusServer    *server)
 {
+  DBusLoop *loop = ctx;
   ServerData *sd;
 
   sd = serverdata_new (loop, server);
@@ -296,7 +305,7 @@ test_server_setup (DBusLoop      *loop,
 }
 
 void
-test_server_shutdown (DBusLoop         *loop,
+test_server_shutdown (TestMainContext  *ctx,
                       DBusServer       *server)
 {
   dbus_server_disconnect (server);
@@ -305,11 +314,44 @@ test_server_shutdown (DBusLoop         *loop,
                                         NULL, NULL, NULL,
                                         NULL,
                                         NULL))
-    _dbus_assert_not_reached ("setting watch functions to NULL failed");
+    die ("setting watch functions to NULL failed");
   
   if (!dbus_server_set_timeout_functions (server,
                                           NULL, NULL, NULL,
                                           NULL,
                                           NULL))
-    _dbus_assert_not_reached ("setting timeout functions to NULL failed");  
+    die ("setting timeout functions to NULL failed");
+}
+
+TestMainContext *
+test_main_context_get (void)
+{
+  return _dbus_loop_new ();
+}
+
+TestMainContext *
+test_main_context_ref (TestMainContext *ctx)
+{
+  return _dbus_loop_ref (ctx);
+}
+
+void test_main_context_unref (TestMainContext *ctx)
+{
+  _dbus_loop_unref (ctx);
+}
+
+void test_main_context_iterate (TestMainContext *ctx,
+                                dbus_bool_t      may_block)
+{
+  _dbus_loop_iterate (ctx, may_block);
+}
+
+void
+test_pending_call_store_reply (DBusPendingCall *pc,
+    void *data)
+{
+  DBusMessage **message_p = data;
+
+  *message_p = dbus_pending_call_steal_reply (pc);
+  _dbus_assert (*message_p != NULL);
 }

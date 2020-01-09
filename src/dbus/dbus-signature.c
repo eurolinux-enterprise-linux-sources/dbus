@@ -410,7 +410,7 @@ dbus_type_is_valid (int typecode)
 
 /** @} */ /* end of DBusSignature group */
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 
 /**
  * @ingroup DBusSignatureInternals
@@ -428,7 +428,7 @@ _dbus_signature_test (void)
   const char *sig;
   dbus_bool_t boolres;
 
-  _dbus_assert (sizeof (DBusSignatureIter) >= sizeof (DBusSignatureRealIter));
+  _DBUS_STATIC_ASSERT (sizeof (DBusSignatureIter) >= sizeof (DBusSignatureRealIter));
 
   sig = "";
   _dbus_assert (dbus_signature_validate (sig, NULL));

@@ -1,26 +1,49 @@
 %global _hardened_build 1
+%{!?_pkgdocdir: %global _pkgdocdir %{_docdir}/%{name}-%{version}}
 
-%define gettext_package dbus
+%global gettext_package         dbus-1
 
-%define expat_version           1.95.5
-%define libselinux_version      1.15.2
+%global expat_version           1.95.5
+%global libselinux_version      1.15.2
 
-%define dbus_user_uid           81
+%global dbus_user_uid           81
 
-%define dbus_common_config_opts --enable-libaudit --enable-selinux=yes --with-init-scripts=redhat --with-system-pid-file=%{_localstatedir}/run/messagebus.pid --with-dbus-user=dbus --libdir=/%{_lib} --bindir=/bin --sysconfdir=/etc --exec-prefix=/ --libexecdir=/%{_lib}/dbus-1 --with-systemdsystemunitdir=/lib/systemd/system/ --enable-doxygen-docs --enable-xml-docs --disable-silent-rules
+%global dbus_common_config_opts --enable-libaudit --enable-selinux=yes --with-init-scripts=redhat --with-system-socket=/run/dbus/system_bus_socket --with-system-pid-file=/run/dbus/messagebus.pid --with-dbus-user=dbus --libexecdir=/%{_libexecdir}/dbus-1 --docdir=%{_pkgdocdir} --enable-installed-tests
 
+# Allow extra dependencies required for some tests to be disabled.
+%bcond_without tests
+# Disabled in June 2014: http://lists.freedesktop.org/archives/dbus/2014-June/016223.html
+%bcond_with check
+
+Name:    dbus
+Epoch:   1
+Version: 1.10.24
+Release: 12%{?dist}
 Summary: D-BUS message bus
-Name: dbus
-Epoch: 1
-Version: 1.6.12
-Release: 14%{?dist}
-URL: http://www.freedesktop.org/software/dbus/
-#VCS: git:git://git.freedesktop.org/git/dbus/dbus
-Source0: http://dbus.freedesktop.org/releases/dbus/%{name}-%{version}.tar.gz
-Source2: 00-start-message-bus.sh
-License: GPLv2+ or AFL
-Group: System Environment/Libraries
-BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
+
+Group:   System Environment/Libraries
+# The effective license of the majority of the package, including the shared
+# library, is "GPL-2+ or AFL-2.1". Certain utilities are "GPL-2+" only.
+License: (GPLv2+ or AFL) and GPLv2+
+URL:     http://www.freedesktop.org/Software/dbus/
+#VCS:    git:git://git.freedesktop.org/git/dbus/dbus
+Source0: http://dbus.freedesktop.org/releases/%{name}/%{name}-%{version}.tar.gz
+Source1: 00-start-message-bus.sh
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=1118399
+Patch0: dbus-1.10.24-mls-listnames.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1183755
+Patch1: dbus-1.6.12-auth-process-ok-message-dispatch-test-fix.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1133732
+Patch2: dbus-1.10.22-reduce-session-conf-fd-limits.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1356141
+Patch3: dbus-1.6.12-avoid-selinux-context-translation.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1467415
+Patch4: dbus-1.10.24-dbus-send-man-page-typo.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1529044
+Patch5: 0001-bus-raise-fd-limits-before-dropping-privs.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1470310
+Patch6: dbus-1.10.24-dbus-launch-chdir.patch
 
 BuildRequires: libtool
 BuildRequires: expat-devel >= %{expat_version}
@@ -28,42 +51,37 @@ BuildRequires: libselinux-devel >= %{libselinux_version}
 BuildRequires: audit-libs-devel >= 0.9
 BuildRequires: libX11-devel
 BuildRequires: libcap-ng-devel
-BuildRequires: gettext
+BuildRequires: pkgconfig(libsystemd)
+BuildRequires: pkgconfig(systemd)
 BuildRequires: doxygen
+# For building XML documentation.
+BuildRequires: /usr/bin/xsltproc
 BuildRequires: xmlto
-BuildRequires: libxslt
-BuildRequires:  systemd-units
-Requires(post): systemd-units chkconfig
-Requires(preun): systemd-units
-Requires(postun): systemd-units
-Requires: libselinux%{?_isa} >= %{libselinux_version}
-Requires: dbus-libs%{?_isa} = %{epoch}:%{version}-%{release}
+
+#For macroized scriptlets.
+Requires(post):   systemd
+Requires(preun):  systemd
+Requires(postun): systemd
+BuildRequires:    systemd
+
+Requires:      libselinux%{?_isa} >= %{libselinux_version}
+Requires:      dbus-libs%{?_isa} = %{epoch}:%{version}-%{release}
 Requires(pre): /usr/sbin/useradd
 
-# Note: These is only required for --enable-tests; when bootstrapping,
-# you can remove this and drop the --enable-tests configure argument.
+# Note: These is only required for --with-tests; when bootstrapping, you can
+# pass --without-tests.
+%if %{with tests}
 BuildRequires: pkgconfig(gio-2.0)
-BuildRequires: pkgconfig(dbus-glib-1)
 BuildRequires: dbus-python
-BuildRequires: pygobject2
+BuildRequires: pygobject3
+%endif
+%if %{with check}
 BuildRequires: /usr/bin/Xvfb
+%endif
 
-# FIXME this should be upstreamed; need --daemon-bindir=/bin and --bindir=/usr/bin or something?
-Patch0: bindir.patch
-Patch1: 0001-name-test-Don-t-run-test-autolaunch-if-we-don-t-have.patch
-Patch2: 0001-test-marshal-Ensure-we-use-suitably-aligned-buffers.patch
-Patch3: 0001-_dbus_babysitter_unref-avoid-infinite-loop-if-waitpi.patch
-Patch4: avoid-undefined-7c00ed22d9b5c33f5b33221e906946b11a9bde3b.patch
-Patch5: 0001-tests-Disable-name-test.patch
-Patch6: dbus-1.6.12-mls-listnames.patch
-Patch7: dbus-1.6.12-auth-process-ok-message-dispatch-test-fix.patch
-Patch8: dbus-1.6.12-reduce-session-conf-fd-limits.patch
-
-# https://bugzilla.redhat.com/show_bug.cgi?id=949022
-Patch9: dbus-1.6.12-refresh-man-pages-and-dbus-launch-help.patch
-
-# https://bugzilla.redhat.com/show_bug.cgi?id=1325870
-Patch10: dbus-1.6.12-avoid-corrupting-multiple-fds.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1498029
+# Remove and fix dependent packages to use /usr/bin/dbus-send in RHEL 8.
+Provides:      /bin/dbus-send
 
 %description
 D-BUS is a system for sending messages between applications. It is
@@ -90,184 +108,314 @@ other supporting documentation such as the introspect dtd file.
 %package devel
 Summary: Development files for D-BUS
 Group: Development/Libraries
+# The server package can be a different architecture.
 Requires: %{name} = %{epoch}:%{version}-%{release}
 
 %description devel
 This package contains libraries and header files needed for
 developing software that uses D-BUS.
 
+%package tests
+Summary: Tests for the %{name} package
+Group: Development/Libraries
+Requires: %{name}%{?_isa} = %{epoch}:%{version}-%{release}
+
+%description tests
+The %{name}-tests package contains tests that can be used to verify
+the functionality of the installed %{name} package.
+
 %package x11
 Summary: X11-requiring add-ons for D-BUS
 Group: Development/Libraries
+# The server package can be a different architecture.
 Requires: %{name} = %{epoch}:%{version}-%{release}
+Requires: xorg-x11-xinit
 
 %description x11
 D-BUS contains some tools that require Xlib to be installed, those are
 in this separate package so server systems need not install X.
 
+
 %prep
-%setup -q -n %{name}-%{version}
-
-# For some reason upstream ships these files as executable
-# Make sure they are not
-/bin/chmod 0644 COPYING ChangeLog NEWS
-
-%patch0 -p1 -b .bindir
+%setup -q
+%patch0 -p1
 %patch1 -p1
 %patch2 -p1
 %patch3 -p1
 %patch4 -p1
 %patch5 -p1
 %patch6 -p1
-%patch7 -p1
-%patch8 -p1
-%patch9 -p1
-%patch10 -p1
 
 %build
-if test -f autogen.sh; then env NOCONFIGURE=1 ./autogen.sh; else autoreconf -v -f -i; fi
-%configure %{dbus_common_config_opts} --disable-tests --disable-asserts
-make
+# Avoid rpath.
+if test -f autogen.sh; then env NOCONFIGURE=1 ./autogen.sh; else autoreconf --verbose --force --install; fi
+
+# Call configure here (before the extra directories for the multiple builds
+# have been created) to ensure that the hardening flag hack is applied to
+# ltmain.sh
+%configure %{dbus_common_config_opts} --enable-doxygen-docs --enable-xml-docs --disable-asserts
+make distclean
+
+mkdir build
+pushd build
+# See /usr/lib/rpm/macros
+%global _configure ../configure
+%configure %{dbus_common_config_opts} --enable-doxygen-docs --enable-xml-docs --disable-asserts
+make V=1 %{?_smp_mflags}
+popd
+
+%if %{with check}
+mkdir build-check
+pushd build-check
+%configure %{dbus_common_config_opts} --enable-asserts --enable-verbose-mode --enable-tests
+make V=1 %{?_smp_mflags}
+popd
+%endif
+
 
 %install
-rm -rf %{buildroot}
+pushd build
+make install DESTDIR=%{buildroot} INSTALL="install -p"
+popd
 
-make install DESTDIR=%{buildroot}
+find %{buildroot} -name '*.a' -type f -delete
+find %{buildroot} -name '*.la' -type f -delete
 
-mkdir -p %{buildroot}/%{_libdir}/pkgconfig
+install -Dp -m755 %{SOURCE1} %{buildroot}%{_sysconfdir}/X11/xinit/xinitrc.d/00-start-message-bus.sh
 
-#change the arch-deps.h include directory to /usr/lib[64] instead of /lib[64]
-sed -e 's@-I${libdir}@-I${prefix}/%{_lib}@' %{buildroot}/%{_lib}/pkgconfig/dbus-1.pc > %{buildroot}/%{_libdir}/pkgconfig/dbus-1.pc
-rm -f %{buildroot}/%{_lib}/pkgconfig/dbus-1.pc
+# Obsolete, but still widely used, for drop-in configuration snippets.
+install --directory %{buildroot}%{_sysconfdir}/dbus-1/session.d
+install --directory %{buildroot}%{_sysconfdir}/dbus-1/system.d
 
-mkdir -p %{buildroot}/%{_bindir}
-mv -f %{buildroot}/bin/dbus-launch %{buildroot}/%{_bindir}
-mkdir -p %{buildroot}/%{_libdir}/dbus-1.0/include/
-mv -f %{buildroot}/%{_lib}/dbus-1.0/include/* %{buildroot}/%{_libdir}/dbus-1.0/include/
-rm -rf %{buildroot}/%{_lib}/dbus-1.0
-
-rm -f %{buildroot}/%{_lib}/*.a
-rm -f %{buildroot}/%{_lib}/*.la
-
-install -D -m755 %{SOURCE2} %{buildroot}%{_sysconfdir}/X11/xinit/xinitrc.d/00-start-message-bus.sh
-
-mkdir -p %{buildroot}%{_datadir}/dbus-1/interfaces
+# This directory is a somewhat unofficial downstream addition
+install --directory %{buildroot}%{_datadir}/dbus-1/interfaces
 
 # Make sure that when somebody asks for D-Bus under the name of the
 # old SysV script, that he ends up with the standard dbus.service name
 # now.
-ln -s dbus.service %{buildroot}/lib/systemd/system/messagebus.service
+ln -s dbus.service %{buildroot}%{_unitdir}/messagebus.service
 
 ## %find_lang %{gettext_package}
 # Delete the old legacy sysv init script
 rm -rf %{buildroot}%{_initrddir}
 
-mkdir -p %{buildroot}/var/lib/dbus
+# Ensure that the ghosted directory has reasonable permissions.
+install --directory %{buildroot}/run/dbus
 
+install --directory %{buildroot}/var/lib/dbus
+
+install -pm 644 -t %{buildroot}%{_pkgdocdir} \
+    doc/introspect.dtd doc/introspect.xsl doc/system-activation.txt
+
+# Make sure that the documentation shows up in Devhelp.
+install --directory %{buildroot}%{_datadir}/gtk-doc/html
+ln -s %{_pkgdocdir} %{buildroot}%{_datadir}/gtk-doc/html/dbus
+
+# dbus.target was removed, in favor of dbus.socket, from systemd 21.
+rm -r %{buildroot}%{_unitdir}/dbus.target.wants
+
+# Shell wrapper for installed tests, modified from Debian package.
+cat > dbus-run-installed-tests <<EOF
+#!/bin/sh
+# installed-tests wrapper for dbus. Outputs TAP format because why not
+
+set -e
+
+timeout="timeout 300s"
+ret=0
+i=0
+tmpdir=\$(mktemp --directory --tmpdir dbus-run-installed-tests.XXXXXX)
+
+for t in %{_libexecdir}/dbus-1/installed-tests/dbus/test-*; do
+    i=\$(( \$i + 1 ))
+    echo "# \$i - \$t ..."
+    echo "x" > "\$tmpdir/result"
+    ( set +e; \$timeout \$t; echo "\$?" > "\$tmpdir/result" ) 2>&1 | sed 's/^/# /'
+    e="\$(cat "\$tmpdir/result")"
+    case "\$e" in
+        (0)
+            echo "ok \$i - \$t"
+            ;;
+        (77)
+            echo "ok \$i # SKIP \$t"
+            ;;
+        (*)
+            echo "not ok \$i - \$t (\$e)"
+            ret=1
+            ;;
+    esac
+done
+
+rm -rf tmpdir
+echo "1..\$i"
+exit \$ret
+EOF
+
+install -pm 755 -t %{buildroot}%{_libexecdir}/dbus-1 dbus-run-installed-tests
+
+
+%if %{with check}
 %check
-if test -f autogen.sh; then env NOCONFIGURE=1 ./autogen.sh; else autoreconf -v -f -i; fi
-%configure %{dbus_common_config_opts} --enable-asserts --enable-verbose-mode --enable-tests
+pushd build-check
 
-make clean
 # TODO: better script for this...
 export DISPLAY=42
-{ Xvfb :${DISPLAY} -nolisten tcp -auth /dev/null &
+{ Xvfb :${DISPLAY} -nolisten tcp -auth /dev/null >/dev/null 2>&1 &
   trap "kill -15 $! || true" 0 HUP INT QUIT TRAP TERM; };
 if ! env DBUS_TEST_SLOW=1 make check; then
-    echo "TESTS FAIL, finding all Automake logs..." 1>&2;
+    echo "Tests failed, finding all Automake logs..." 1>&2;
     find . -type f -name '*.trs' | while read trs; do cat ${trs}; cat ${trs%%.trs}.log; done
     echo  "Exiting abnormally due to make check failure above" 1>&2;
     exit 1;
-else
-    echo "TESTS PASS"
 fi
+popd
+%endif
 
-%clean
-rm -rf %{buildroot}
 
 %pre
 # Add the "dbus" user and group
 /usr/sbin/groupadd -r -g %{dbus_user_uid} dbus 2>/dev/null || :
 /usr/sbin/useradd -c 'System message bus' -u %{dbus_user_uid} -g %{dbus_user_uid} \
-	-s /sbin/nologin -r -d '/' dbus 2> /dev/null || :
+    -s /sbin/nologin -r -d '/' dbus 2> /dev/null || :
 
 %post libs -p /sbin/ldconfig
 
 %preun
-if [ $1 = 0 ]; then
-  /bin/systemctl stop dbus.service dbus.socket > /dev/null 2>&1 || :
-fi
+%systemd_preun stop dbus.service dbus.socket
 
 %postun libs -p /sbin/ldconfig
 
 %postun
-/bin/systemctl daemon-reload >/dev/null 2>&1 || :
+%systemd_postun
 
-%triggerun -- dbus < 1.4.10-2
-/sbin/chkconfig --del messagebus >/dev/null 2>&1 || :
 
 %files
-%defattr(-,root,root)
-
-%doc COPYING
-
+# Strictly speaking, we could remove the COPYING from this subpackage and
+# just have it be in libs, because dbus Requires dbus-libs.
+%{!?_licensedir:%global license %%doc}
+%license COPYING
+%doc AUTHORS ChangeLog HACKING NEWS README
+%exclude %{_pkgdocdir}/api
+%exclude %{_pkgdocdir}/dbus.devhelp
+%exclude %{_pkgdocdir}/diagram.*
+%exclude %{_pkgdocdir}/introspect.*
+%exclude %{_pkgdocdir}/system-activation.txt
+%exclude %{_pkgdocdir}/*.html
 %dir %{_sysconfdir}/dbus-1
-%config %{_sysconfdir}/dbus-1/*.conf
-%dir %{_sysconfdir}/dbus-1/system.d
 %dir %{_sysconfdir}/dbus-1/session.d
-%ghost %dir %{_localstatedir}/run/dbus
+%dir %{_sysconfdir}/dbus-1/system.d
+%config %{_sysconfdir}/dbus-1/session.conf
+%config %{_sysconfdir}/dbus-1/system.conf
+%ghost %dir /run/%{name}
 %dir %{_localstatedir}/lib/dbus/
-/bin/dbus-daemon
-/bin/dbus-send
-/bin/dbus-cleanup-sockets
-/bin/dbus-monitor
-/bin/dbus-uuidgen
-%{_mandir}/man*/dbus-cleanup-sockets.1.gz
-%{_mandir}/man*/dbus-daemon.1.gz
-%{_mandir}/man*/dbus-monitor.1.gz
-%{_mandir}/man*/dbus-send.1.gz
-%{_mandir}/man*/dbus-uuidgen.1.gz
+%{_bindir}/dbus-daemon
+%{_bindir}/dbus-send
+%{_bindir}/dbus-cleanup-sockets
+%{_bindir}/dbus-run-session
+%{_bindir}/dbus-monitor
+%{_bindir}/dbus-test-tool
+%{_bindir}/dbus-update-activation-environment
+%{_bindir}/dbus-uuidgen
+%{_mandir}/man1/dbus-cleanup-sockets.1*
+%{_mandir}/man1/dbus-daemon.1*
+%{_mandir}/man1/dbus-run-session.1*
+%{_mandir}/man1/dbus-monitor.1*
+%{_mandir}/man1/dbus-send.1*
+%{_mandir}/man1/dbus-test-tool.1*
+%{_mandir}/man1/dbus-update-activation-environment.1*
+%{_mandir}/man1/dbus-uuidgen.1*
 %dir %{_datadir}/dbus-1
+%{_datadir}/dbus-1/session.conf
+%{_datadir}/dbus-1/system.conf
 %{_datadir}/dbus-1/services
 %{_datadir}/dbus-1/system-services
 %{_datadir}/dbus-1/interfaces
-%dir /%{_lib}/dbus-1
+%dir %{_libexecdir}/dbus-1
 # See doc/system-activation.txt in source tarball for the rationale
 # behind these permissions
-%attr(4750,root,dbus) /%{_lib}/dbus-1/dbus-daemon-launch-helper
-/lib/systemd/system/dbus.service
-/lib/systemd/system/dbus.socket
-/lib/systemd/system/dbus.target.wants/dbus.socket
-/lib/systemd/system/messagebus.service
-/lib/systemd/system/multi-user.target.wants/dbus.service
-/lib/systemd/system/sockets.target.wants/dbus.socket
+%attr(4750,root,dbus) %{_libexecdir}/dbus-1/dbus-daemon-launch-helper
+%exclude %{_libexecdir}/dbus-1/dbus-run-installed-tests
+%{_unitdir}/dbus.service
+%{_unitdir}/dbus.socket
+%{_unitdir}/messagebus.service
+%{_unitdir}/multi-user.target.wants/dbus.service
+%{_unitdir}/sockets.target.wants/dbus.socket
 
 %files libs
-%defattr(-,root,root,-)
-/%{_lib}/*dbus-1*.so.*
+%{!?_licensedir:%global license %%doc}
+%license COPYING
+%{_libdir}/*dbus-1*.so.*
+
+%files tests
+%{_libexecdir}/dbus-1/installed-tests
+%{_libexecdir}/dbus-1/dbus-run-installed-tests
+%{_datadir}/installed-tests
 
 %files x11
-%defattr(-,root,root)
-
 %{_bindir}/dbus-launch
-%{_datadir}/man/man*/dbus-launch.1.gz
+%{_mandir}/man1/dbus-launch.1*
 %{_sysconfdir}/X11/xinit/xinitrc.d/00-start-message-bus.sh
 
 %files doc
-%defattr(-,root,root)
-%doc doc/introspect.dtd doc/introspect.xsl doc/system-activation.txt
-%doc %{_datadir}/doc/dbus
+%{_pkgdocdir}/*
+%{_datadir}/gtk-doc
+%exclude %{_pkgdocdir}/AUTHORS
+%exclude %{_pkgdocdir}/ChangeLog
+%exclude %{_pkgdocdir}/HACKING
+%exclude %{_pkgdocdir}/NEWS
+%exclude %{_pkgdocdir}/README
 
 %files devel
-%defattr(-,root,root)
-
-/%{_lib}/lib*.so
+%{_libdir}/lib*.so
 %dir %{_libdir}/dbus-1.0
 %{_libdir}/dbus-1.0/include/
 %{_libdir}/pkgconfig/dbus-1.pc
 %{_includedir}/*
 
 %changelog
+* Tue Aug 21 2018 Ray Strode <rstrode@redhat.com> - 1:1.10.24-12
+- Use HOME as dbus-daemon --session working directory (#1470310)
+
+* Fri Jun 22 2018 David King <dking@redhat.com> - 1:1.10.24-11
+- Use HOME as dbus-launch working directory (#1470310)
+
+* Thu Feb 15 2018 David King <dking@redhat.com> - 1:1.10.24-7
+- Improve permissions on /run/dbus (#1510773)
+
+* Tue Feb 13 2018 David King <dking@redhat.com> - 1:1.10.24-6
+- Rebase MLS patch (#1534902)
+
+* Mon Feb 12 2018 Ray Strode <rstrode@redhat.com> - 1:1.10.24-5
+- Raise FD limits before dropping privileges
+  Resolves: #1529044
+
+* Tue Jan 09 2018 David King <dking@redhat.com> - 1:1.10.24-4
+- Make xinit script work with set -u (#1452539)
+
+* Wed Oct 04 2017 David King <dking@redhat.com> - 1:1.10.24-3
+- Add a Provides for old dbus-send (#1498029)
+
+* Tue Oct 03 2017 David King <dking@redhat.com> - 1:1.10.24-2
+- Fix dbus-send.1 man page typo (#1467415)
+
+* Thu Sep 28 2017 David King <dking@redhat.com> - 1:1.10.24-1
+- Rebase to 1.10.24 (#1480264)
+
+* Fri Sep 15 2017 David King <dking@redhat.com> - 1:1.10.22-1
+- Rebase to 1.10.22 (#1480264)
+
+* Tue Nov 15 2016 David King <dking@redhat.com> - 1:1.6.12-18
+- Fix fd leak in error path (#1370381)
+
+* Mon Sep 12 2016 David King <dking@redhat.com> - 1:1.6.12-17
+- Improve SELinux context translation patch (#1356141)
+
+* Mon Aug 22 2016 David King <dking@redhat.com> - 1:1.6.12-16
+- Fix SELinux MLS context translation (#1356141)
+
+* Mon Aug 08 2016 David King <dking@redhat.com> - 1:1.6.12-15
+- Avoid hardcoded SELinux constants (#1364485)
+
 * Tue Apr 26 2016 David King <dking@redhat.com> - 1:1.6.12-14
 - Close multiple fds correctly (#1325870)
 

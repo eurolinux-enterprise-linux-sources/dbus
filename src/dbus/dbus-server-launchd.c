@@ -40,7 +40,9 @@
 #include <launch.h>
 #include <errno.h>
 
+#include "dbus-misc.h"
 #include "dbus-server-socket.h"
+#include "dbus-sysdeps-unix.h"
 
 /* put other private launchd functions here */
 
@@ -176,18 +178,16 @@ _dbus_server_new_for_launchd (const char *launchd_env_var, DBusError * error)
           else
             {
               display = launch_data_get_string(environment_param);
-              _dbus_setenv ("DISPLAY", display);
+              dbus_setenv ("DISPLAY", display);
             }
         }
     }
 
       }
 
-    server = _dbus_server_new_for_socket (&launchd_fd, 1, &address, 0);
+    server = _dbus_server_new_for_socket (&launchd_fd, 1, &address, 0, error);
     if (server == NULL)
       {
-        dbus_set_error (error, DBUS_ERROR_NO_SERVER,
-                        "Unable to listen on launchd fd %d.", launchd_fd);
         goto l_failed_0;
       }
 

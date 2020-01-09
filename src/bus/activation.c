@@ -637,7 +637,7 @@ update_directory (BusActivation       *activation,
 
       if (!_dbus_string_ends_with_c_str (&filename, ".service"))
         {
-          _dbus_verbose ("Skipping non-.service file %s\n",
+          _dbus_verbose ("Skipping non-.service file '%s'\n",
                          _dbus_string_get_const_data (&filename));
           continue;
         }
@@ -1044,7 +1044,7 @@ restore_pending (void *data)
 }
 
 static void
-free_pending_restore_data (void *data)
+free_restore_pending_data (void *data)
 {
   RestorePendingData *d = data;
 
@@ -1074,9 +1074,9 @@ add_restore_pending_to_transaction (BusTransaction       *transaction,
 
   if (d->hash_entry == NULL ||
       !bus_transaction_add_cancel_hook (transaction, restore_pending, d,
-                                        free_pending_restore_data))
+                                        free_restore_pending_data))
     {
-      free_pending_restore_data (d);
+      free_restore_pending_data (d);
       return FALSE;
     }
 
@@ -1162,13 +1162,10 @@ bus_activation_service_created (BusActivation  *activation,
 dbus_bool_t
 bus_activation_send_pending_auto_activation_messages (BusActivation  *activation,
                                                       BusService     *service,
-                                                      BusTransaction *transaction,
-                                                      DBusError      *error)
+                                                      BusTransaction *transaction)
 {
   BusPendingActivation *pending_activation;
   DBusList *link;
-
-  _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
   /* Check if it's a pending activation */
   pending_activation = _dbus_hash_table_lookup_string (activation->pending_activations,
@@ -1186,6 +1183,9 @@ bus_activation_send_pending_auto_activation_messages (BusActivation  *activation
       if (entry->auto_activation && (entry->connection == NULL || dbus_connection_get_is_connected (entry->connection)))
         {
           DBusConnection *addressed_recipient;
+          DBusError error;
+
+          dbus_error_init (&error);
 
           addressed_recipient = bus_service_get_primary_owners_connection (service);
 
@@ -1193,8 +1193,22 @@ bus_activation_send_pending_auto_activation_messages (BusActivation  *activation
           if (!bus_dispatch_matches (transaction,
                                      entry->connection,
                                      addressed_recipient,
-                                     entry->activation_message, error))
-            goto error;
+                                     entry->activation_message, &error))
+            {
+              /* If permission is denied, we just want to return the error
+               * to the original method invoker; in particular, we don't
+               * want to make the RequestName call fail with that error
+               * (see fd.o #78979, CVE-2014-3477). */
+              if (!bus_transaction_send_error_reply (transaction, entry->connection,
+                                                     &error, entry->activation_message))
+                {
+                  bus_connection_send_oom_error (entry->connection,
+                                                 entry->activation_message);
+                }
+
+              link = next;
+              continue;
+            }
         }
 
       link = next;
@@ -1203,7 +1217,6 @@ bus_activation_send_pending_auto_activation_messages (BusActivation  *activation
   if (!add_restore_pending_to_transaction (transaction, pending_activation))
     {
       _dbus_verbose ("Could not add cancel hook to transaction to revert removing pending activation\n");
-      BUS_SET_OOM (error);
       goto error;
     }
 
@@ -1289,6 +1302,10 @@ handle_servicehelper_exit_error (int        exit_code,
 {
   switch (exit_code)
     {
+    case BUS_SPAWN_EXIT_CODE_CONFIG_INVALID:
+      dbus_set_error (error, DBUS_ERROR_SPAWN_CONFIG_INVALID,
+		      "Invalid configuration (missing or empty <user>?)");
+      break;
     case BUS_SPAWN_EXIT_CODE_NO_MEMORY:
       dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
                       "Launcher could not run (out of memory)");
@@ -1325,6 +1342,7 @@ handle_servicehelper_exit_error (int        exit_code,
       dbus_set_error (error, DBUS_ERROR_SPAWN_CHILD_SIGNALED,
                       "Launched child was signaled, it probably crashed");
       break;
+    case BUS_SPAWN_EXIT_CODE_GENERIC_FAILURE:
     default:
       dbus_set_error (error, DBUS_ERROR_SPAWN_CHILD_EXITED,
                       "Launch helper exited with unknown return code %i", exit_code);
@@ -1400,7 +1418,8 @@ pending_activation_finished_cb (DBusBabysitter *babysitter,
             {
               BusPendingActivation *p = _dbus_hash_iter_get_value (&iter);
 
-              if (p != pending_activation && strcmp (p->exec, pending_activation->exec) == 0)
+              if (p != pending_activation && p->exec != NULL &&
+                  strcmp (p->exec, pending_activation->exec) == 0)
                 pending_activation_failed (p, &error);
             }
 
@@ -1460,11 +1479,8 @@ pending_activation_timed_out (void *data)
 
   dbus_error_init (&error);
 
-  dbus_set_error (&error, DBUS_ERROR_TIMED_OUT,
-                  "Activation of %s timed out",
-                  pending_activation->service_name);
-  bus_context_log (pending_activation->activation->context,
-                   DBUS_SYSTEM_LOG_INFO,
+  bus_context_log_and_set_error (pending_activation->activation->context,
+                   DBUS_SYSTEM_LOG_INFO, &error, DBUS_ERROR_TIMED_OUT,
                    "Failed to activate service '%s': timed out",
                    pending_activation->service_name);
 
@@ -1670,6 +1686,31 @@ out:
   return retval;
 }
 
+static void
+child_setup (void *user_data)
+{
+#ifdef DBUS_UNIX
+  BusActivation *activation = user_data;
+  DBusRLimit *initial_fd_limit;
+  DBusError error;
+
+  dbus_error_init (&error);
+  initial_fd_limit = bus_context_get_initial_fd_limit (activation->context);
+
+  if (initial_fd_limit != NULL &&
+      !_dbus_rlimit_restore_fd_limit (initial_fd_limit, &error))
+    {
+      /* unfortunately we don't actually know the service name here */
+      bus_context_log (activation->context,
+                       DBUS_SYSTEM_LOG_WARNING,
+                       "Failed to reset fd limit before activating "
+                       "service: %s: %s",
+                       error.name, error.message);
+    }
+#endif
+}
+
+
 dbus_bool_t
 bus_activation_activate_service (BusActivation  *activation,
                                  DBusConnection *connection,
@@ -1704,9 +1745,19 @@ bus_activation_activate_service (BusActivation  *activation,
       return FALSE;
     }
 
-  entry = activation_find_entry (activation, service_name, error);
-  if (!entry)
-    return FALSE;
+  if (bus_context_get_systemd_activation (activation->context) &&
+      strcmp (service_name, "org.freedesktop.systemd1") == 0)
+    {
+      /* if we're doing systemd activation, we assume systemd will connect
+       * eventually, and it does not need a .service file */
+      entry = NULL;
+    }
+  else
+    {
+      entry = activation_find_entry (activation, service_name, error);
+      if (!entry)
+        return FALSE;
+    }
 
   /* Bypass the registry lookup if we're auto-activating, bus_dispatch would not
    * call us if the service is already active.
@@ -1813,17 +1864,20 @@ bus_activation_activate_service (BusActivation  *activation,
           return FALSE;
         }
 
-      pending_activation->exec = _dbus_strdup (entry->exec);
-      if (!pending_activation->exec)
+      if (entry != NULL)
         {
-          _dbus_verbose ("Failed to copy service exec for pending activation\n");
-          BUS_SET_OOM (error);
-          bus_pending_activation_unref (pending_activation);
-          bus_pending_activation_entry_free (pending_activation_entry);
-          return FALSE;
+          pending_activation->exec = _dbus_strdup (entry->exec);
+          if (!pending_activation->exec)
+            {
+              _dbus_verbose ("Failed to copy service exec for pending activation\n");
+              BUS_SET_OOM (error);
+              bus_pending_activation_unref (pending_activation);
+              bus_pending_activation_entry_free (pending_activation_entry);
+              return FALSE;
+            }
         }
 
-      if (entry->systemd_service)
+      if (entry != NULL && entry->systemd_service != NULL)
         {
           pending_activation->systemd_service = _dbus_strdup (entry->systemd_service);
           if (!pending_activation->systemd_service)
@@ -1893,10 +1947,7 @@ bus_activation_activate_service (BusActivation  *activation,
     {
       _dbus_verbose ("Failed to add pending activation cancel hook to transaction\n");
       BUS_SET_OOM (error);
-      _dbus_hash_table_remove_string (activation->pending_activations,
-                                      pending_activation->service_name);
-
-      return FALSE;
+      goto cancel_pending_activation;
     }
 
   if (was_pending_activation)
@@ -1916,6 +1967,7 @@ bus_activation_activate_service (BusActivation  *activation,
           DBusString service_string;
           BusService *service;
           BusRegistry *registry;
+          DBusConnection *systemd = NULL;
 
           /* OK, we have a systemd service configured for this entry,
              hence let's enqueue an activation request message. This
@@ -1934,7 +1986,7 @@ bus_activation_activate_service (BusActivation  *activation,
             {
               _dbus_verbose ("No memory to create activation message\n");
               BUS_SET_OOM (error);
-              return FALSE;
+              goto cancel_pending_activation;
             }
 
           if (!dbus_message_set_sender (message, DBUS_SERVICE_DBUS) ||
@@ -1946,7 +1998,7 @@ bus_activation_activate_service (BusActivation  *activation,
               _dbus_verbose ("No memory to set args of activation message\n");
               dbus_message_unref (message);
               BUS_SET_OOM (error);
-              return FALSE;
+              goto cancel_pending_activation;
             }
 
           /* Create our transaction */
@@ -1956,13 +2008,27 @@ bus_activation_activate_service (BusActivation  *activation,
               _dbus_verbose ("No memory to create activation transaction\n");
               dbus_message_unref (message);
               BUS_SET_OOM (error);
-              return FALSE;
+              goto cancel_pending_activation;
             }
 
           /* Check whether systemd is already connected */
           registry = bus_connection_get_registry (connection);
           _dbus_string_init_const (&service_string, "org.freedesktop.systemd1");
           service = bus_registry_lookup (registry, &service_string);
+
+          if (service)
+            systemd = bus_service_get_primary_owners_connection (service);
+
+          /* Following the general principle of "log early and often",
+           * we capture that we *want* to send the activation message, even if
+           * systemd is not actually there to receive it yet */
+          if (!bus_transaction_capture (activation_transaction,
+                                        NULL, systemd, message))
+            {
+              dbus_message_unref (message);
+              BUS_SET_OOM (error);
+              goto cancel_pending_activation;
+            }
 
           if (service != NULL)
             {
@@ -1971,8 +2037,8 @@ bus_activation_activate_service (BusActivation  *activation,
                                service_name,
                                entry->systemd_service);
               /* Wonderful, systemd is connected, let's just send the msg */
-              retval = bus_dispatch_matches (activation_transaction, NULL, bus_service_get_primary_owners_connection (service),
-                                             message, error);
+              retval = bus_dispatch_matches (activation_transaction, NULL,
+                                             systemd, message, error);
             }
           else
             {
@@ -1996,7 +2062,7 @@ bus_activation_activate_service (BusActivation  *activation,
               _DBUS_ASSERT_ERROR_IS_SET (error);
               _dbus_verbose ("failed to send activation message: %s\n", error->name);
               bus_transaction_cancel_and_free (activation_transaction);
-              return FALSE;
+              goto cancel_pending_activation;
             }
 
           bus_transaction_execute_and_free (activation_transaction);
@@ -2007,11 +2073,16 @@ bus_activation_activate_service (BusActivation  *activation,
          proceed with traditional activation. */
     }
 
+  /* If entry was NULL, it would be because we were doing systemd activation
+   * and activating systemd itself; but we already handled that case with
+   * an early-return */
+  _dbus_assert (entry != NULL);
+
   /* use command as system and session different */
   if (!_dbus_string_init (&command))
     {
       BUS_SET_OOM (error);
-      return FALSE;
+      goto cancel_pending_activation;
     }
 
   /* does the bus use a helper? */
@@ -2023,7 +2094,7 @@ bus_activation_activate_service (BusActivation  *activation,
           _dbus_string_free (&command);
           dbus_set_error (error, DBUS_ERROR_SPAWN_FILE_INVALID,
                           "Cannot do system-bus activation with no user\n");
-          return FALSE;
+          goto cancel_pending_activation;
         }
 
       /* join the helper path and the service name */
@@ -2031,19 +2102,19 @@ bus_activation_activate_service (BusActivation  *activation,
         {
           _dbus_string_free (&command);
           BUS_SET_OOM (error);
-          return FALSE;
+          goto cancel_pending_activation;
         }
       if (!_dbus_string_append (&command, " "))
         {
           _dbus_string_free (&command);
           BUS_SET_OOM (error);
-          return FALSE;
+          goto cancel_pending_activation;
         }
       if (!_dbus_string_append (&command, service_name))
         {
           _dbus_string_free (&command);
           BUS_SET_OOM (error);
-          return FALSE;
+          goto cancel_pending_activation;
         }
     }
   else
@@ -2053,7 +2124,7 @@ bus_activation_activate_service (BusActivation  *activation,
         {
           _dbus_string_free (&command);
           BUS_SET_OOM (error);
-          return FALSE;
+          goto cancel_pending_activation;
         }
     }
 
@@ -2062,12 +2133,8 @@ bus_activation_activate_service (BusActivation  *activation,
     {
       _dbus_verbose ("Failed to parse command line: %s\n", entry->exec);
       _DBUS_ASSERT_ERROR_IS_SET (error);
-
-      _dbus_hash_table_remove_string (activation->pending_activations,
-                                      pending_activation->service_name);
-
       _dbus_string_free (&command);
-      return FALSE;
+      goto cancel_pending_activation;
     }
   _dbus_string_free (&command);
 
@@ -2075,7 +2142,7 @@ bus_activation_activate_service (BusActivation  *activation,
     {
       _DBUS_ASSERT_ERROR_IS_SET (error);
       dbus_free_string_array (argv);
-      return FALSE;
+      goto cancel_pending_activation;
     }
 
   envp = bus_activation_get_environment (activation);
@@ -2084,7 +2151,7 @@ bus_activation_activate_service (BusActivation  *activation,
     {
       BUS_SET_OOM (error);
       dbus_free_string_array (argv);
-      return FALSE;
+      goto cancel_pending_activation;
     }
 
   _dbus_verbose ("Spawning %s ...\n", argv[0]);
@@ -2099,9 +2166,12 @@ bus_activation_activate_service (BusActivation  *activation,
 
   dbus_error_init (&tmp_error);
 
-  if (!_dbus_spawn_async_with_babysitter (&pending_activation->babysitter, argv,
+  if (!_dbus_spawn_async_with_babysitter (&pending_activation->babysitter,
+                                          service_name,
+                                          argv,
                                           envp,
-                                          NULL, activation,
+                                          child_setup,
+                                          activation,
                                           &tmp_error))
     {
       _dbus_verbose ("Failed to spawn child\n");
@@ -2113,8 +2183,7 @@ bus_activation_activate_service (BusActivation  *activation,
       dbus_move_error (&tmp_error, error);
       dbus_free_string_array (argv);
       dbus_free_string_array (envp);
-
-      return FALSE;
+      goto cancel_pending_activation;
     }
 
   dbus_free_string_array (argv);
@@ -2135,10 +2204,16 @@ bus_activation_activate_service (BusActivation  *activation,
     {
       BUS_SET_OOM (error);
       _dbus_verbose ("Failed to set babysitter watch functions\n");
-      return FALSE;
+      goto cancel_pending_activation;
     }
 
   return TRUE;
+
+cancel_pending_activation:
+  _DBUS_ASSERT_ERROR_IS_SET (error);
+  _dbus_hash_table_remove_string (activation->pending_activations,
+                                  pending_activation->service_name);
+  return FALSE;
 }
 
 dbus_bool_t
@@ -2179,7 +2254,7 @@ bus_activation_list_services (BusActivation *activation,
 
  error:
   for (j = 0; j < i; j++)
-    dbus_free (retval[i]);
+    dbus_free (retval[j]);
   dbus_free (retval);
 
   return FALSE;
@@ -2203,7 +2278,7 @@ dbus_activation_systemd_failure (BusActivation *activation,
                              DBUS_TYPE_STRING, &code,
                              DBUS_TYPE_STRING, &str,
                              DBUS_TYPE_INVALID))
-    dbus_set_error(&error, code, str);
+    dbus_set_error (&error, code, "%s", str);
 
 
   if (unit)
@@ -2232,7 +2307,7 @@ dbus_activation_systemd_failure (BusActivation *activation,
   return TRUE;
 }
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 
 #include <stdio.h>
 
@@ -2343,6 +2418,7 @@ test_remove_directory (DBusString *dir)
       if (!test_remove_service_file (dir, _dbus_string_get_const_data (&filename)))
         {
           ret_val = FALSE;
+          _dbus_directory_close (iter);
           goto out;
         }
     }
@@ -2364,21 +2440,8 @@ out:
 static dbus_bool_t
 init_service_reload_test (DBusString *dir)
 {
-  DBusStat stat_buf;
-
-  if (!_dbus_stat (dir, &stat_buf, NULL))
-    {
-      if (!_dbus_create_directory (dir, NULL))
-        return FALSE;
-    }
-  else
-    {
-      if (!test_remove_directory (dir))
-        return FALSE;
-
-      if (!_dbus_create_directory (dir, NULL))
-        return FALSE;
-    }
+  if (!_dbus_create_directory (dir, NULL))
+    return FALSE;
 
   /* Create one initial file */
   if (!test_create_service_file (dir, SERVICE_FILE_1, SERVICE_NAME_1, "exec-1"))
@@ -2539,18 +2602,23 @@ dbus_bool_t
 bus_activation_service_reload_test (const DBusString *test_data_dir)
 {
   DBusString directory;
+  const char *tmp;
+  dbus_bool_t ret = FALSE;
 
   if (!_dbus_string_init (&directory))
     return FALSE;
 
-  if (!_dbus_string_append (&directory, _dbus_get_tmpdir()))
-    return FALSE;
+  tmp = _dbus_get_tmpdir ();
+
+  if (tmp == NULL)
+    goto out;
+
+  if (!_dbus_string_append (&directory, tmp))
+    goto out;
 
   if (!_dbus_string_append (&directory, "/dbus-reload-test-") ||
-      !_dbus_generate_random_ascii (&directory, 6))
-     {
-       return FALSE;
-     }
+      !_dbus_generate_random_ascii (&directory, 6, NULL))
+    goto out;
 
   /* Do normal tests */
   if (!init_service_reload_test (&directory))
@@ -2560,6 +2628,9 @@ bus_activation_service_reload_test (const DBusString *test_data_dir)
     {
       /* Do nothing? */
     }
+
+  if (!cleanup_service_reload_test (&directory))
+    goto out;
 
   /* Do OOM tests */
   if (!init_service_reload_test (&directory))
@@ -2572,11 +2643,13 @@ bus_activation_service_reload_test (const DBusString *test_data_dir)
 
   /* Cleanup test directory */
   if (!cleanup_service_reload_test (&directory))
-    return FALSE;
+    goto out;
 
+  ret = TRUE;
+
+out:
   _dbus_string_free (&directory);
-
-  return TRUE;
+  return ret;
 }
 
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */

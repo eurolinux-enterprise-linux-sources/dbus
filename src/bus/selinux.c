@@ -28,6 +28,7 @@
 #include <dbus/dbus-userdb.h>
 #endif
 #include "selinux.h"
+#include "audit.h"
 #include "services.h"
 #include "policy.h"
 #include "utils.h"
@@ -44,15 +45,12 @@
 #include <syslog.h>
 #include <selinux/selinux.h>
 #include <selinux/avc.h>
-#include <selinux/av_permissions.h>
-#include <selinux/flask.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <grp.h>
 #endif /* HAVE_SELINUX */
 #ifdef HAVE_LIBAUDIT
-#include <cap-ng.h>
 #include <libaudit.h>
 #endif /* HAVE_LIBAUDIT */
 
@@ -117,54 +115,40 @@ static const struct avc_lock_callback lock_cb =
  */
 #ifdef HAVE_SELINUX
 
-#ifdef HAVE_LIBAUDIT
-static int audit_fd = -1;
-#endif
-
-void
-bus_selinux_audit_init(void)
-{
-#ifdef HAVE_LIBAUDIT  
-  audit_fd = audit_open ();
-
-  if (audit_fd < 0)
-    {
-      /* If kernel doesn't support audit, bail out */
-      if (errno == EINVAL || errno == EPROTONOSUPPORT || errno == EAFNOSUPPORT)
-        return;
-      /* If user bus, bail out */
-      if (errno == EPERM && getuid() != 0)
-        return;
-      _dbus_warn ("Failed opening connection to the audit subsystem");
-    }
-#endif /* HAVE_LIBAUDIT */
-}
-
 static void 
 log_callback (const char *fmt, ...) 
 {
   va_list ap;
+#ifdef HAVE_LIBAUDIT
+  int audit_fd;
+#endif
 
   va_start(ap, fmt);
 
 #ifdef HAVE_LIBAUDIT
+  audit_fd = bus_audit_get_fd ();
+
   if (audit_fd >= 0)
   {
-    capng_get_caps_process();
-    if (capng_have_capability(CAPNG_EFFECTIVE, CAP_AUDIT_WRITE))
-    {
-      char buf[PATH_MAX*2];
-    
-      /* FIXME: need to change this to show real user */
-      vsnprintf(buf, sizeof(buf), fmt, ap);
-      audit_log_user_avc_message(audit_fd, AUDIT_USER_AVC, buf, NULL, NULL,
-                               NULL, getuid());
-      return;
-    }
+    /* This should really be a DBusString, but DBusString allocates
+     * memory dynamically; before switching it, we need to check with
+     * SELinux people that it would be OK for this to fall back to
+     * syslog if OOM, like the equivalent AppArmor code does. */
+    char buf[PATH_MAX*2];
+
+    /* FIXME: need to change this to show real user */
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    audit_log_user_avc_message(audit_fd, AUDIT_USER_AVC, buf, NULL, NULL,
+                             NULL, getuid());
+    goto out;
   }
 #endif /* HAVE_LIBAUDIT */
-  
+
   vsyslog (LOG_USER | LOG_INFO, fmt, ap);
+
+#ifdef HAVE_LIBAUDIT
+out:
+#endif
   va_end(ap);
 }
 
@@ -314,8 +298,27 @@ bus_selinux_pre_init (void)
 #endif
 }
 
+/*
+ * Private Flask definitions; the order of these constants must
+ * exactly match that of the structure array below!
+ */
+/* security dbus class constants */
+#define SECCLASS_DBUS       1
+
+/* dbus's per access vector constants */
+#define DBUS__ACQUIRE_SVC   1
+#define DBUS__SEND_MSG      2
+
+#ifdef HAVE_SELINUX
+static struct security_class_mapping dbus_map[] = {
+  { "dbus", { "acquire_svc", "send_msg", NULL } },
+  { NULL }
+};
+#endif /* HAVE_SELINUX */
+
 /**
- * Initialize the user space access vector cache (AVC) for D-Bus and set up
+ * Establish dynamic object class and permission mapping and
+ * initialize the user space access vector cache (AVC) for D-Bus and set up
  * logging callbacks.
  */
 dbus_bool_t
@@ -333,6 +336,13 @@ bus_selinux_full_init (void)
     }
 
   _dbus_verbose ("SELinux is enabled in this kernel.\n");
+
+  if (selinux_set_mapping (dbus_map) < 0)
+    {
+      _dbus_warn ("Failed to set up security class mapping (selinux_set_mapping():%s).\n",
+                   strerror (errno));
+      return FALSE; 
+    }
 
   avc_entry_ref_init (&aeref);
   if (avc_init ("avc", &mem_cb, &log_cb, &thread_cb, &lock_cb) < 0)
@@ -936,8 +946,7 @@ bus_selinux_get_policy_root (void)
 void
 bus_selinux_id_table_print (DBusHashTable *service_table)
 {
-#ifdef DBUS_ENABLE_VERBOSE_MODE
-#ifdef HAVE_SELINUX
+#if defined (DBUS_ENABLE_VERBOSE_MODE) && defined (HAVE_SELINUX)
   DBusHashIter iter;
 
   if (!selinux_enabled)
@@ -953,19 +962,18 @@ bus_selinux_id_table_print (DBusHashTable *service_table)
       _dbus_verbose ("The context is %s\n", sid->ctx);
       _dbus_verbose ("The refcount is %d\n", sid->refcnt);
     }
-#endif /* HAVE_SELINUX */
-#endif /* DBUS_ENABLE_VERBOSE_MODE */
+#endif /* DBUS_ENABLE_VERBOSE_MODE && HAVE_SELINUX */
 }
 
 
-#ifdef DBUS_ENABLE_VERBOSE_MODE
-#ifdef HAVE_SELINUX
 /**
  * Print out some AVC statistics.
  */
+#ifdef HAVE_SELINUX
 static void
 bus_avc_print_stats (void)
 {
+#ifdef DBUS_ENABLE_VERBOSE_MODE
   struct avc_cache_stats cstats;
 
   if (!selinux_enabled)
@@ -983,10 +991,9 @@ bus_avc_print_stats (void)
   _dbus_verbose ("CAV hits: %d\n", cstats.cav_hits);
   _dbus_verbose ("CAV probes: %d\n", cstats.cav_probes);
   _dbus_verbose ("CAV misses: %d\n", cstats.cav_misses);
+#endif /* DBUS_ENABLE_VERBOSE_MODE */
 }
 #endif /* HAVE_SELINUX */
-#endif /* DBUS_ENABLE_VERBOSE_MODE */
-
 
 /**
  * Destroy the AVC before we terminate.
@@ -1005,89 +1012,9 @@ bus_selinux_shutdown (void)
       sidput (bus_sid);
       bus_sid = SECSID_WILD;
 
-#ifdef DBUS_ENABLE_VERBOSE_MODE
- 
-      if (_dbus_is_verbose()) 
-        bus_avc_print_stats ();
- 
-#endif /* DBUS_ENABLE_VERBOSE_MODE */
+      bus_avc_print_stats ();
 
       avc_destroy ();
-#ifdef HAVE_LIBAUDIT
-      audit_close (audit_fd);
-#endif /* HAVE_LIBAUDIT */
     }
 #endif /* HAVE_SELINUX */
 }
-
-/* The !HAVE_LIBAUDIT case lives in dbus-sysdeps-util-unix.c */
-#ifdef HAVE_LIBAUDIT
-/**
- * Changes the user and group the bus is running as.
- *
- * @param user the user to become
- * @param error return location for errors
- * @returns #FALSE on failure
- */
-dbus_bool_t
-_dbus_change_to_daemon_user  (const char    *user,
-                              DBusError     *error)
-{
-  dbus_uid_t uid;
-  dbus_gid_t gid;
-  DBusString u;
-
-  _dbus_string_init_const (&u, user);
-
-  if (!_dbus_get_user_id_and_primary_group (&u, &uid, &gid))
-    {
-      dbus_set_error (error, DBUS_ERROR_FAILED,
-                      "User '%s' does not appear to exist?",
-                      user);
-      return FALSE;
-    }
-
-  /* If we were root */
-  if (_dbus_geteuid () == 0)
-    {
-      int rc;
-
-      capng_clear (CAPNG_SELECT_BOTH);
-      capng_update (CAPNG_ADD, CAPNG_EFFECTIVE | CAPNG_PERMITTED,
-                    CAP_AUDIT_WRITE);
-      rc = capng_change_id (uid, gid, CAPNG_DROP_SUPP_GRP);
-      if (rc)
-        {
-          switch (rc) {
-            default:
-              dbus_set_error (error, DBUS_ERROR_FAILED,
-                              "Failed to drop capabilities: %s\n",
-                              _dbus_strerror (errno));
-              break;
-            case -4:
-              dbus_set_error (error, _dbus_error_from_errno (errno),
-                              "Failed to set GID to %lu: %s", gid,
-                              _dbus_strerror (errno));
-              break;
-            case -5:
-              _dbus_warn ("Failed to drop supplementary groups: %s\n",
-                          _dbus_strerror (errno));
-              break;
-            case -6:
-              dbus_set_error (error, _dbus_error_from_errno (errno),
-                              "Failed to set UID to %lu: %s", uid,
-                              _dbus_strerror (errno));
-              break;
-            case -7:
-              dbus_set_error (error, _dbus_error_from_errno (errno),
-                              "Failed to unset keep-capabilities: %s\n",
-                              _dbus_strerror (errno));
-              break;
-          }
-          return FALSE;
-        }
-    }
-
- return TRUE;
-}
-#endif

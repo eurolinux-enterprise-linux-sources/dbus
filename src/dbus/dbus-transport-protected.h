@@ -67,7 +67,7 @@ struct DBusTransportVTable
   /**< Outstanding messages counter changed */
 
   dbus_bool_t (* get_socket_fd) (DBusTransport *transport,
-                                 int           *fd_p);
+                                 DBusSocket    *fd_p);
   /**< Get socket file descriptor */
 };
 
@@ -111,7 +111,7 @@ struct DBusTransport
   DBusFreeFunction free_windows_user_data;            /**< Function to free windows_user_data */
   
   unsigned int disconnected : 1;              /**< #TRUE if we are disconnected. */
-  unsigned int authenticated : 1;             /**< Cache of auth state; use _dbus_transport_get_is_authenticated() to query value */
+  unsigned int authenticated : 1;             /**< Cache of auth state; use _dbus_transport_peek_is_authenticated() to query value */
   unsigned int send_credentials_pending : 1;  /**< #TRUE if we need to send credentials */
   unsigned int receive_credentials_pending : 1; /**< #TRUE if we need to receive credentials */
   unsigned int is_server : 1;                 /**< #TRUE if on the server side */

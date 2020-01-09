@@ -28,8 +28,10 @@
 #include "utils.h"
 #include "policy.h"
 #include "selinux.h"
+#include "apparmor.h"
 #include <dbus/dbus-list.h>
 #include <dbus/dbus-internals.h>
+#include <dbus/dbus-misc.h>
 #include <dbus/dbus-sysdeps.h>
 #include <string.h>
 
@@ -317,13 +319,23 @@ merge_included (BusConfigParser *parser,
   if (included->keep_umask)
     parser->keep_umask = TRUE;
 
+  if (included->allow_anonymous)
+    parser->allow_anonymous = TRUE;
+
   if (included->pidfile != NULL)
     {
       dbus_free (parser->pidfile);
       parser->pidfile = included->pidfile;
       included->pidfile = NULL;
     }
-  
+
+  if (included->servicehelper != NULL)
+    {
+      dbus_free (parser->servicehelper);
+      parser->servicehelper = included->servicehelper;
+      included->servicehelper = NULL;
+    }
+
   while ((link = _dbus_list_pop_first_link (&included->listen_on)))
     _dbus_list_append_link (&parser->listen_on, link);
 
@@ -413,9 +425,9 @@ bus_config_parser_new (const DBusString      *basedir,
       maximum number of file descriptors we can receive. Picking a
       high value here thus translates directly to more memory
       allocation. */
-      parser->limits.max_incoming_unix_fds = 1024*4;
-      parser->limits.max_outgoing_unix_fds = 1024*4;
-      parser->limits.max_message_unix_fds = 1024;
+      parser->limits.max_incoming_unix_fds = DBUS_DEFAULT_MESSAGE_UNIX_FDS*4;
+      parser->limits.max_outgoing_unix_fds = DBUS_DEFAULT_MESSAGE_UNIX_FDS*4;
+      parser->limits.max_message_unix_fds = DBUS_DEFAULT_MESSAGE_UNIX_FDS;
       
       /* Making this long means the user has to wait longer for an error
        * message if something screws up, but making it too short means
@@ -428,6 +440,11 @@ bus_config_parser_new (const DBusString      *basedir,
        * password) is allowed, then potentially it has to be quite long.
        */
       parser->limits.auth_timeout = 30000; /* 30 seconds */
+
+      /* Do not allow a fd to stay forever in dbus-daemon
+       * https://bugs.freedesktop.org/show_bug.cgi?id=80559
+       */
+      parser->limits.pending_fd_timeout = 150000; /* 2.5 minutes */
       
       parser->limits.max_incomplete_connections = 64;
       parser->limits.max_connections_per_user = 256;
@@ -456,7 +473,7 @@ bus_config_parser_new (const DBusString      *basedir,
       /* this is effectively a limit on message queue size for messages
        * that require a reply
        */
-      parser->limits.max_replies_per_connection = 1024*8;
+      parser->limits.max_replies_per_connection = 128;
     }
       
   parser->refcount = 1;
@@ -1119,6 +1136,27 @@ start_busconfig_child (BusConfigParser   *parser,
         }
 
       return TRUE;
+    }
+  else if (element_type == ELEMENT_APPARMOR)
+    {
+      Element *e;
+      const char *mode;
+
+      if ((e = push_element (parser, ELEMENT_APPARMOR)) == NULL)
+        {
+          BUS_SET_OOM (error);
+          return FALSE;
+        }
+
+      if (!locate_attributes (parser, "apparmor",
+                              attribute_names,
+                              attribute_values,
+                              error,
+                              "mode", &mode,
+                              NULL))
+        return FALSE;
+
+      return bus_apparmor_set_mode_from_config (mode, error);
     }
   else
     {
@@ -1891,6 +1929,12 @@ set_limit (BusConfigParser *parser,
       must_be_int = TRUE;
       parser->limits.auth_timeout = value;
     }
+  else if (strcmp (name, "pending_fd_timeout") == 0)
+    {
+      must_be_positive = TRUE;
+      must_be_int = TRUE;
+      parser->limits.pending_fd_timeout = value;
+    }
   else if (strcmp (name, "reply_timeout") == 0)
     {
       must_be_positive = TRUE;
@@ -2052,6 +2096,7 @@ bus_config_parser_end_element (BusConfigParser   *parser,
     case ELEMENT_STANDARD_SESSION_SERVICEDIRS:
     case ELEMENT_STANDARD_SYSTEM_SERVICEDIRS:
     case ELEMENT_ALLOW_ANONYMOUS:
+    case ELEMENT_APPARMOR:
       break;
     }
 
@@ -2220,7 +2265,15 @@ include_dir (BusConfigParser   *parser,
   dir = _dbus_directory_open (dirname, error);
 
   if (dir == NULL)
-    goto failed;
+    {
+      if (dbus_error_has_name (error, DBUS_ERROR_FILE_NOT_FOUND))
+        {
+          dbus_error_free (error);
+          goto success;
+        }
+      else
+        goto failed;
+    }
 
   dbus_error_init (&tmp_error);
   while (_dbus_directory_get_next_file (dir, &filename, &tmp_error))
@@ -2290,6 +2343,7 @@ include_dir (BusConfigParser   *parser,
       goto failed;
     }
 
+ success:
   retval = TRUE;
   
  failed:
@@ -2351,6 +2405,7 @@ bus_config_parser_content (BusConfigParser   *parser,
     case ELEMENT_ALLOW_ANONYMOUS:
     case ELEMENT_SELINUX:
     case ELEMENT_ASSOCIATE:
+    case ELEMENT_APPARMOR:
       if (all_whitespace (content))
         return TRUE;
       else
@@ -2735,7 +2790,7 @@ bus_config_parser_steal_service_context_table (BusConfigParser *parser)
   return table;
 }
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 #include <stdio.h>
 
 typedef enum
@@ -3097,6 +3152,7 @@ limits_equal (const BusLimits *a,
      || a->max_message_unix_fds == b->max_message_unix_fds
      || a->activation_timeout == b->activation_timeout
      || a->auth_timeout == b->auth_timeout
+     || a->pending_fd_timeout == b->pending_fd_timeout
      || a->max_completed_connections == b->max_completed_connections
      || a->max_incomplete_connections == b->max_incomplete_connections
      || a->max_connections_per_user == b->max_connections_per_user
@@ -3345,41 +3401,46 @@ test_default_session_servicedirs (void)
   DBusList *dirs;
   DBusList *link;
   DBusString progs;
+  DBusString install_root_based;
   int i;
-
+  dbus_bool_t ret = FALSE;
 #ifdef DBUS_WIN
+  const char *tmp;
   const char *common_progs;
-  char buffer[1024];
-
-  if (_dbus_get_install_root(buffer, sizeof(buffer)))
-    {
-      strcat(buffer,DBUS_DATADIR);
-      strcat(buffer,"/dbus-1/services");
-      test_session_service_dir_matches[0] = buffer;
-    }
 #endif
 
-  /* On Unix we don't actually use this variable, but it's easier to handle the
-   * deallocation if we always allocate it, whether needed or not */
-  if (!_dbus_string_init (&progs))
-    _dbus_assert_not_reached ("OOM allocating progs");
+  /* On Unix we don't actually use these, but it's easier to handle the
+   * deallocation if we always allocate them, whether needed or not */
+  if (!_dbus_string_init (&progs) ||
+      !_dbus_string_init (&install_root_based))
+    _dbus_assert_not_reached ("OOM allocating strings");
 
-#ifndef DBUS_UNIX
+#ifdef DBUS_WIN
+  if (!_dbus_string_append (&install_root_based, DBUS_DATADIR) ||
+      !_dbus_string_append (&install_root_based, "/dbus-1/services"))
+    goto out;
+
+  tmp = _dbus_replace_install_prefix (
+      _dbus_string_get_const_data (&install_root_based));
+
+  if (tmp == NULL ||
+      !_dbus_string_set_length (&install_root_based, 0) ||
+      !_dbus_string_append (&install_root_based, tmp))
+    goto out;
+
+  test_session_service_dir_matches[0] = _dbus_string_get_const_data (
+      &install_root_based);
+
   common_progs = _dbus_getenv ("CommonProgramFiles");
 
   if (common_progs) 
     {
       if (!_dbus_string_append (&progs, common_progs)) 
-        {
-          _dbus_string_free (&progs);
-          return FALSE;
-        }
+        goto out;
 
       if (!_dbus_string_append (&progs, "/dbus-1/services")) 
-        {
-          _dbus_string_free (&progs);
-          return FALSE;
-        }
+        goto out;
+
       test_session_service_dir_matches[1] = _dbus_string_get_const_data(&progs);
     }
 #endif
@@ -3401,8 +3462,7 @@ test_default_session_servicedirs (void)
           printf ("error with default session service directories\n");
 	      dbus_free (link->data);
     	  _dbus_list_free_link (link);
-          _dbus_string_free (&progs);
-          return FALSE;
+          goto out;
         }
  
       dbus_free (link->data);
@@ -3410,10 +3470,10 @@ test_default_session_servicedirs (void)
     }
 
 #ifdef DBUS_UNIX
-  if (!_dbus_setenv ("XDG_DATA_HOME", "/testhome/foo/.testlocal/testshare"))
+  if (!dbus_setenv ("XDG_DATA_HOME", "/testhome/foo/.testlocal/testshare"))
     _dbus_assert_not_reached ("couldn't setenv XDG_DATA_HOME");
 
-  if (!_dbus_setenv ("XDG_DATA_DIRS", ":/testusr/testlocal/testshare: :/testusr/testshare:"))
+  if (!dbus_setenv ("XDG_DATA_DIRS", ":/testusr/testlocal/testshare: :/testusr/testshare:"))
     _dbus_assert_not_reached ("couldn't setenv XDG_DATA_DIRS");
 #endif
   if (!_dbus_get_standard_session_servicedirs (&dirs))
@@ -3429,8 +3489,7 @@ test_default_session_servicedirs (void)
           printf ("more directories parsed than in match set\n");
           dbus_free (link->data);
           _dbus_list_free_link (link);
-          _dbus_string_free (&progs);
-          return FALSE;
+          goto out;
         }
  
       if (strcmp (test_session_service_dir_matches[i], 
@@ -3441,8 +3500,7 @@ test_default_session_servicedirs (void)
                   test_session_service_dir_matches[i]);
           dbus_free (link->data);
           _dbus_list_free_link (link);
-          _dbus_string_free (&progs);
-          return FALSE;
+          goto out;
         }
 
       ++i;
@@ -3455,13 +3513,15 @@ test_default_session_servicedirs (void)
     {
       printf ("extra data %s in the match set was not matched\n",
               test_session_service_dir_matches[i]);
-
-      _dbus_string_free (&progs);
-      return FALSE;
+      goto out;
     }
-    
+
+  ret = TRUE;
+
+out:
+  _dbus_string_free (&install_root_based);
   _dbus_string_free (&progs);
-  return TRUE;
+  return ret;
 }
 
 static const char *test_system_service_dir_matches[] = 
@@ -3543,10 +3603,10 @@ test_default_system_servicedirs (void)
     }
 
 #ifdef DBUS_UNIX
-  if (!_dbus_setenv ("XDG_DATA_HOME", "/testhome/foo/.testlocal/testshare"))
+  if (!dbus_setenv ("XDG_DATA_HOME", "/testhome/foo/.testlocal/testshare"))
     _dbus_assert_not_reached ("couldn't setenv XDG_DATA_HOME");
 
-  if (!_dbus_setenv ("XDG_DATA_DIRS", ":/testusr/testlocal/testshare: :/testusr/testshare:"))
+  if (!dbus_setenv ("XDG_DATA_DIRS", ":/testusr/testlocal/testshare: :/testusr/testshare:"))
     _dbus_assert_not_reached ("couldn't setenv XDG_DATA_DIRS");
 #endif
   if (!_dbus_get_standard_system_servicedirs (&dirs))
@@ -3620,6 +3680,11 @@ bus_config_parser_test (const DBusString *test_data_dir)
   if (!process_test_valid_subdir (test_data_dir, "valid-config-files", VALID))
     return FALSE;
 
+#ifndef DBUS_WIN
+  if (!process_test_valid_subdir (test_data_dir, "valid-config-files-system", VALID))
+    return FALSE;
+#endif
+
   if (!process_test_valid_subdir (test_data_dir, "invalid-config-files", INVALID))
     return FALSE;
 
@@ -3629,5 +3694,5 @@ bus_config_parser_test (const DBusString *test_data_dir)
   return TRUE;
 }
 
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */
 

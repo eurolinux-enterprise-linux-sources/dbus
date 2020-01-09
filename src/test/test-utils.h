@@ -1,25 +1,31 @@
 #ifndef TEST_UTILS_H
 #define TEST_UTILS_H
-#ifndef DBUS_COMPILATION
-#define DBUS_COMPILATION /* Cheat and use private stuff */
-#endif
-#include <dbus/dbus.h>
+
 #include <stdio.h>
 #include <stdlib.h>
+
+#include <dbus/dbus.h>
+
 #include <dbus/dbus-mainloop.h>
 #include <dbus/dbus-internals.h>
-#undef DBUS_COMPILATION
+typedef DBusLoop TestMainContext;
 
-dbus_bool_t test_connection_setup                 (DBusLoop       *loop,
-                                                   DBusConnection *connection);
-void        test_connection_shutdown              (DBusLoop       *loop,
-                                                   DBusConnection *connection);
-void        test_connection_dispatch_all_messages (DBusConnection *connection);
-dbus_bool_t test_connection_dispatch_one_message  (DBusConnection *connection);
+TestMainContext *test_main_context_get            (void);
+TestMainContext *test_main_context_ref            (TestMainContext *ctx);
+void             test_main_context_unref          (TestMainContext *ctx);
+void             test_main_context_iterate        (TestMainContext *ctx,
+                                                   dbus_bool_t      may_block);
 
-dbus_bool_t test_server_setup                     (DBusLoop      *loop,
+dbus_bool_t test_connection_setup                 (TestMainContext *ctx,
+                                                   DBusConnection *connection);
+void        test_connection_shutdown              (TestMainContext *ctx,
+                                                   DBusConnection *connection);
+
+dbus_bool_t test_server_setup                     (TestMainContext *ctx,
                                                    DBusServer    *server);
-void        test_server_shutdown                  (DBusLoop      *loop,
+void        test_server_shutdown                  (TestMainContext *ctx,
                                                    DBusServer    *server);
+void        test_pending_call_store_reply         (DBusPendingCall *pc,
+                                                   void *data);
 
 #endif

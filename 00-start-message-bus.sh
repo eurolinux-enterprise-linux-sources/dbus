@@ -9,6 +9,9 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 #
+
+DBUS_SESSION_BUS_ADDRESS=`printenv DBUS_SESSION_BUS_ADDRESS`
+
 if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
         eval `dbus-launch --sh-syntax --exit-with-session`
 fi

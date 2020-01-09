@@ -519,7 +519,7 @@ _dbus_hash_iter_init (DBusHashTable *table,
 {
   DBusRealHashIter *real;
   
-  _dbus_assert (sizeof (DBusHashIter) == sizeof (DBusRealHashIter));
+  _DBUS_STATIC_ASSERT (sizeof (DBusHashIter) == sizeof (DBusRealHashIter));
   
   real = (DBusRealHashIter*) iter;
 
@@ -544,7 +544,7 @@ _dbus_hash_iter_next (DBusHashIter  *iter)
 {
   DBusRealHashIter *real;
   
-  _dbus_assert (sizeof (DBusHashIter) == sizeof (DBusRealHashIter));
+  _DBUS_STATIC_ASSERT (sizeof (DBusHashIter) == sizeof (DBusRealHashIter));
   
   real = (DBusRealHashIter*) iter;
 
@@ -746,7 +746,7 @@ _dbus_hash_iter_lookup (DBusHashTable *table,
   DBusHashEntry *entry;
   DBusHashEntry **bucket;
   
-  _dbus_assert (sizeof (DBusHashIter) == sizeof (DBusRealHashIter));
+  _DBUS_STATIC_ASSERT (sizeof (DBusHashIter) == sizeof (DBusRealHashIter));
   
   real = (DBusRealHashIter*) iter;
 
@@ -1401,7 +1401,7 @@ _dbus_hash_table_get_n_entries (DBusHashTable *table)
 
 /** @} */
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 #include "dbus-test.h"
 #include <stdio.h>
 
@@ -1828,4 +1828,4 @@ _dbus_hash_test (void)
   return ret;
 }
 
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */

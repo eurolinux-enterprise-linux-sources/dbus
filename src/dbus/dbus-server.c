@@ -26,7 +26,7 @@
 #include "dbus-server-unix.h"
 #include "dbus-server-socket.h"
 #include "dbus-string.h"
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 #include "dbus-server-debug-pipe.h"
 #endif
 #include "dbus-address.h"
@@ -105,12 +105,14 @@ copy_address_with_guid_appended (const DBusString *address,
  * @param server the server.
  * @param vtable the vtable for the subclass.
  * @param address the server's address
+ * @param error location to store reason for failure
  * @returns #TRUE on success.
  */
 dbus_bool_t
 _dbus_server_init_base (DBusServer             *server,
                         const DBusServerVTable *vtable,
-                        const DBusString       *address)
+                        const DBusString       *address,
+                        DBusError              *error)
 {
   server->vtable = vtable;
 
@@ -130,29 +132,33 @@ _dbus_server_init_base (DBusServer             *server,
   server->published_address = FALSE;
 
   if (!_dbus_string_init (&server->guid_hex))
-    return FALSE;
+    {
+      _DBUS_SET_OOM (error);
+      return FALSE;
+    }
 
-  _dbus_generate_uuid (&server->guid);
+  if (!_dbus_generate_uuid (&server->guid, error))
+    goto failed;
 
   if (!_dbus_uuid_encode (&server->guid, &server->guid_hex))
-    goto failed;
+    goto oom;
   
   server->address = copy_address_with_guid_appended (address,
                                                      &server->guid_hex);
   if (server->address == NULL)
-    goto failed;
+    goto oom;
   
   _dbus_rmutex_new_at_location (&server->mutex);
   if (server->mutex == NULL)
-    goto failed;
+    goto oom;
   
   server->watches = _dbus_watch_list_new ();
   if (server->watches == NULL)
-    goto failed;
+    goto oom;
 
   server->timeouts = _dbus_timeout_list_new ();
   if (server->timeouts == NULL)
-    goto failed;
+    goto oom;
 
   _dbus_data_slot_list_init (&server->slot_list);
 
@@ -160,6 +166,8 @@ _dbus_server_init_base (DBusServer             *server,
   
   return TRUE;
 
+ oom:
+  _DBUS_SET_OOM (error);
  failed:
   _dbus_rmutex_free_at_location (&server->mutex);
   server->mutex = NULL;
@@ -312,26 +320,17 @@ _dbus_server_remove_watch  (DBusServer *server,
 }
 
 /**
- * Toggles a watch and notifies app via server's
- * DBusWatchToggledFunction if available. It's an error to call this
- * function on a watch that was not previously added.
+ * Toggles all watch and notifies app via server's
+ * DBusWatchToggledFunction if available.
  *
  * @param server the server.
- * @param watch the watch to toggle.
  * @param enabled whether to enable or disable
  */
 void
-_dbus_server_toggle_watch (DBusServer  *server,
-                           DBusWatch   *watch,
-                           dbus_bool_t  enabled)
+_dbus_server_toggle_all_watches (DBusServer  *server,
+                                dbus_bool_t  enabled)
 {
-  _dbus_assert (watch != NULL);
-
-  HAVE_LOCK_CHECK (server);
-  protected_change_watch (server, watch,
-                          NULL, NULL,
-                          _dbus_watch_list_toggle_watch,
-                          enabled);
+  _dbus_watch_list_toggle_all_watches (server->watches, enabled);
 }
 
 /** Function to be called in protected_change_timeout() with refcount held */
@@ -529,7 +528,7 @@ static const struct {
 } listen_funcs[] = {
   { _dbus_server_listen_socket }
   , { _dbus_server_listen_platform_specific }
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
   , { _dbus_server_listen_debug_pipe }
 #endif
 };
@@ -699,13 +698,11 @@ dbus_server_ref (DBusServer *server)
 
   _dbus_return_val_if_fail (server != NULL, NULL);
 
-  /* can't get the refcount without a side-effect */
   old_refcount = _dbus_atomic_inc (&server->refcount);
 
 #ifndef DBUS_DISABLE_CHECKS
   if (_DBUS_UNLIKELY (old_refcount <= 0))
     {
-      /* undo side-effect first */
       _dbus_atomic_dec (&server->refcount);
       _dbus_warn_check_failed (_dbus_return_if_fail_warning_format,
                                _DBUS_FUNCTION_NAME, "old_refcount > 0",
@@ -736,13 +733,18 @@ dbus_server_unref (DBusServer *server)
 
   _dbus_return_if_fail (server != NULL);
 
-  /* can't get the refcount without a side-effect */
   old_refcount = _dbus_atomic_dec (&server->refcount);
 
 #ifndef DBUS_DISABLE_CHECKS
   if (_DBUS_UNLIKELY (old_refcount <= 0))
     {
-      /* undo side-effect first */
+      /* undo side-effect first
+       * please do not try to simplify the code here by using
+       * _dbus_atomic_get(), why we don't use it is
+       * because it issues another atomic operation even though
+       * DBUS_DISABLE_CHECKS defined.
+       * Bug: https://bugs.freedesktop.org/show_bug.cgi?id=68303
+       */
       _dbus_atomic_inc (&server->refcount);
       _dbus_warn_check_failed (_dbus_return_if_fail_warning_format,
                                _DBUS_FUNCTION_NAME, "old_refcount > 0",
@@ -777,16 +779,7 @@ dbus_server_disconnect (DBusServer *server)
 {
   _dbus_return_if_fail (server != NULL);
 
-#ifdef DBUS_DISABLE_CHECKS
-  _dbus_atomic_inc (&server->refcount);
-#else
-    {
-      dbus_int32_t old_refcount = _dbus_atomic_inc (&server->refcount);
-
-      _dbus_return_if_fail (old_refcount > 0);
-    }
-#endif
-
+  dbus_server_ref (server);
   SERVER_LOCK (server);
 
   _dbus_assert (server->vtable->disconnect != NULL);
@@ -1058,7 +1051,10 @@ dbus_server_set_auth_mechanisms (DBusServer  *server,
     {
       copy = _dbus_dup_string_array (mechanisms);
       if (copy == NULL)
-        return FALSE;
+        {
+          SERVER_UNLOCK (server);
+          return FALSE;
+        }
     }
   else
     copy = NULL;
@@ -1071,9 +1067,8 @@ dbus_server_set_auth_mechanisms (DBusServer  *server,
   return TRUE;
 }
 
-
-static DBusDataSlotAllocator slot_allocator;
-_DBUS_DEFINE_GLOBAL_LOCK (server_slots);
+static DBusDataSlotAllocator slot_allocator =
+  _DBUS_DATA_SLOT_ALLOCATOR_INIT (_DBUS_LOCK_NAME (server_slots));
 
 /**
  * Allocates an integer ID to be used for storing application-specific
@@ -1093,7 +1088,6 @@ dbus_bool_t
 dbus_server_allocate_data_slot (dbus_int32_t *slot_p)
 {
   return _dbus_data_slot_allocator_alloc (&slot_allocator,
-                                          (DBusRMutex **)&_DBUS_LOCK_NAME (server_slots),
                                           slot_p);
 }
 
@@ -1190,7 +1184,7 @@ dbus_server_get_data (DBusServer   *server,
 
 /** @} */
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 #include "dbus-test.h"
 #include <string.h>
 
@@ -1246,4 +1240,4 @@ _dbus_server_test (void)
   return TRUE;
 }
 
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */

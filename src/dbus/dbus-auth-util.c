@@ -33,8 +33,7 @@
 
 /** @} */
 
-#ifdef DBUS_BUILD_TESTS
-#include "dbus-test.h"
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 #include "dbus-auth-script.h"
 #include <stdio.h>
 
@@ -167,4 +166,4 @@ _dbus_auth_test (const char *test_data_dir)
   return TRUE;
 }
 
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */

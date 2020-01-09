@@ -1,5 +1,8 @@
 /* stats.c - statistics from the bus driver
  *
+ * Copyright © 2011-2012 Nokia Corporation
+ * Copyright © 2012-2013 Collabora Ltd.
+ *
  * Licensed under the Academic Free License version 2.1
  *
  * This program is free software; you can redistribute it and/or modify
@@ -21,161 +24,17 @@
 #include <config.h>
 #include "stats.h"
 
+#include <dbus/dbus-asv-util.h>
 #include <dbus/dbus-internals.h>
 #include <dbus/dbus-connection-internal.h>
 
 #include "connection.h"
+#include "driver.h"
 #include "services.h"
+#include "signals.h"
 #include "utils.h"
 
 #ifdef DBUS_ENABLE_STATS
-
-static DBusMessage *
-new_asv_reply (DBusMessage      *message,
-               DBusMessageIter  *iter,
-               DBusMessageIter  *arr_iter)
-{
-  DBusMessage *reply = dbus_message_new_method_return (message);
-
-  if (reply == NULL)
-    return NULL;
-
-  dbus_message_iter_init_append (reply, iter);
-
-  if (!dbus_message_iter_open_container (iter, DBUS_TYPE_ARRAY, "{sv}",
-                                         arr_iter))
-    {
-      dbus_message_unref (reply);
-      return NULL;
-    }
-
-  return reply;
-}
-
-static dbus_bool_t
-open_asv_entry (DBusMessageIter *arr_iter,
-                DBusMessageIter *entry_iter,
-                const char      *key,
-                const char      *type,
-                DBusMessageIter *var_iter)
-{
-  if (!dbus_message_iter_open_container (arr_iter, DBUS_TYPE_DICT_ENTRY,
-                                         NULL, entry_iter))
-    return FALSE;
-
-  if (!dbus_message_iter_append_basic (entry_iter, DBUS_TYPE_STRING, &key))
-    {
-      dbus_message_iter_abandon_container (arr_iter, entry_iter);
-      return FALSE;
-    }
-
-  if (!dbus_message_iter_open_container (entry_iter, DBUS_TYPE_VARIANT,
-                                         type, var_iter))
-    {
-      dbus_message_iter_abandon_container (arr_iter, entry_iter);
-      return FALSE;
-    }
-
-  return TRUE;
-}
-
-static dbus_bool_t
-close_asv_entry (DBusMessageIter *arr_iter,
-                 DBusMessageIter *entry_iter,
-                 DBusMessageIter *var_iter)
-{
-  if (!dbus_message_iter_close_container (entry_iter, var_iter))
-    {
-      dbus_message_iter_abandon_container (arr_iter, entry_iter);
-      return FALSE;
-    }
-
-  if (!dbus_message_iter_close_container (arr_iter, entry_iter))
-    return FALSE;
-
-  return TRUE;
-}
-
-static dbus_bool_t
-close_asv_reply (DBusMessageIter *iter,
-                 DBusMessageIter *arr_iter)
-{
-  return dbus_message_iter_close_container (iter, arr_iter);
-}
-
-static void
-abandon_asv_entry (DBusMessageIter *arr_iter,
-                   DBusMessageIter *entry_iter,
-                   DBusMessageIter *var_iter)
-{
-  dbus_message_iter_abandon_container (entry_iter, var_iter);
-  dbus_message_iter_abandon_container (arr_iter, entry_iter);
-}
-
-static void
-abandon_asv_reply (DBusMessageIter *iter,
-                 DBusMessageIter *arr_iter)
-{
-  dbus_message_iter_abandon_container (iter, arr_iter);
-}
-
-static dbus_bool_t
-asv_add_uint32 (DBusMessageIter *iter,
-                DBusMessageIter *arr_iter,
-                const char *key,
-                dbus_uint32_t value)
-{
-  DBusMessageIter entry_iter, var_iter;
-
-  if (!open_asv_entry (arr_iter, &entry_iter, key, DBUS_TYPE_UINT32_AS_STRING,
-                       &var_iter))
-    goto oom;
-
-  if (!dbus_message_iter_append_basic (&var_iter, DBUS_TYPE_UINT32,
-                                       &value))
-    {
-      abandon_asv_entry (arr_iter, &entry_iter, &var_iter);
-      goto oom;
-    }
-
-  if (!close_asv_entry (arr_iter, &entry_iter, &var_iter))
-    goto oom;
-
-  return TRUE;
-
-oom:
-  abandon_asv_reply (iter, arr_iter);
-  return FALSE;
-}
-
-static dbus_bool_t
-asv_add_string (DBusMessageIter *iter,
-                DBusMessageIter *arr_iter,
-                const char *key,
-                const char *value)
-{
-  DBusMessageIter entry_iter, var_iter;
-
-  if (!open_asv_entry (arr_iter, &entry_iter, key, DBUS_TYPE_STRING_AS_STRING,
-                       &var_iter))
-    goto oom;
-
-  if (!dbus_message_iter_append_basic (&var_iter, DBUS_TYPE_STRING,
-                                       &value))
-    {
-      abandon_asv_entry (arr_iter, &entry_iter, &var_iter);
-      goto oom;
-    }
-
-  if (!close_asv_entry (arr_iter, &entry_iter, &var_iter))
-    goto oom;
-
-  return TRUE;
-
-oom:
-  abandon_asv_reply (iter, arr_iter);
-  return FALSE;
-}
 
 dbus_bool_t
 bus_stats_handle_get_stats (DBusConnection *connection,
@@ -183,6 +42,7 @@ bus_stats_handle_get_stats (DBusConnection *connection,
                             DBusMessage    *message,
                             DBusError      *error)
 {
+  BusContext *context;
   BusConnections *connections;
   DBusMessage *reply = NULL;
   DBusMessageIter iter, arr_iter;
@@ -191,49 +51,56 @@ bus_stats_handle_get_stats (DBusConnection *connection,
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
-  connections = bus_transaction_get_connections (transaction);
+  if (!bus_driver_check_message_is_for_us (message, error))
+    return FALSE;
 
-  reply = new_asv_reply (message, &iter, &arr_iter);
+  context = bus_transaction_get_context (transaction);
+  connections = bus_context_get_connections (context);
+
+  reply = _dbus_asv_new_method_return (message, &iter, &arr_iter);
 
   if (reply == NULL)
     goto oom;
 
   /* Globals */
 
-  if (!asv_add_uint32 (&iter, &arr_iter, "Serial", stats_serial++))
-    goto oom;
-
   _dbus_list_get_stats (&in_use, &in_free_list, &allocated);
-  if (!asv_add_uint32 (&iter, &arr_iter, "ListMemPoolUsedBytes", in_use) ||
-      !asv_add_uint32 (&iter, &arr_iter, "ListMemPoolCachedBytes",
-                       in_free_list) ||
-      !asv_add_uint32 (&iter, &arr_iter, "ListMemPoolAllocatedBytes",
-                       allocated))
-    goto oom;
+
+  if (!_dbus_asv_add_uint32 (&arr_iter, "Serial", stats_serial++) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "ListMemPoolUsedBytes", in_use) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "ListMemPoolCachedBytes", in_free_list) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "ListMemPoolAllocatedBytes", allocated))
+    {
+      _dbus_asv_abandon (&iter, &arr_iter);
+      goto oom;
+    }
 
   /* Connections */
 
-  if (!asv_add_uint32 (&iter, &arr_iter, "ActiveConnections",
+  if (!_dbus_asv_add_uint32 (&arr_iter, "ActiveConnections",
         bus_connections_get_n_active (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "IncompleteConnections",
+      !_dbus_asv_add_uint32 (&arr_iter, "IncompleteConnections",
         bus_connections_get_n_incomplete (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "MatchRules",
+      !_dbus_asv_add_uint32 (&arr_iter, "MatchRules",
         bus_connections_get_total_match_rules (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakMatchRules",
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakMatchRules",
         bus_connections_get_peak_match_rules (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakMatchRulesPerConnection",
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakMatchRulesPerConnection",
         bus_connections_get_peak_match_rules_per_conn (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "BusNames",
+      !_dbus_asv_add_uint32 (&arr_iter, "BusNames",
         bus_connections_get_total_bus_names (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakBusNames",
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakBusNames",
         bus_connections_get_peak_bus_names (connections)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakBusNamesPerConnection",
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakBusNamesPerConnection",
         bus_connections_get_peak_bus_names_per_conn (connections)))
-    goto oom;
+    {
+      _dbus_asv_abandon (&iter, &arr_iter);
+      goto oom;
+    }
 
   /* end */
 
-  if (!close_asv_reply (&iter, &arr_iter))
+  if (!_dbus_asv_close (&iter, &arr_iter))
     goto oom;
 
   if (!bus_transaction_send_from_driver (transaction, connection, reply))
@@ -269,6 +136,9 @@ bus_stats_handle_get_connection_stats (DBusConnection *caller_connection,
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
+  if (!bus_driver_check_message_is_for_us (message, error))
+    return FALSE;
+
   registry = bus_connection_get_registry (caller_connection);
 
   if (! dbus_message_get_args (message, error,
@@ -289,25 +159,28 @@ bus_stats_handle_get_connection_stats (DBusConnection *caller_connection,
   stats_connection = bus_service_get_primary_owners_connection (service);
   _dbus_assert (stats_connection != NULL);
 
-  reply = new_asv_reply (message, &iter, &arr_iter);
+  reply = _dbus_asv_new_method_return (message, &iter, &arr_iter);
 
   if (reply == NULL)
     goto oom;
 
   /* Bus daemon per-connection stats */
 
-  if (!asv_add_uint32 (&iter, &arr_iter, "Serial", stats_serial++) ||
-      !asv_add_uint32 (&iter, &arr_iter, "MatchRules",
+  if (!_dbus_asv_add_uint32 (&arr_iter, "Serial", stats_serial++) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "MatchRules",
         bus_connection_get_n_match_rules (stats_connection)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakMatchRules",
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakMatchRules",
         bus_connection_get_peak_match_rules (stats_connection)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "BusNames",
+      !_dbus_asv_add_uint32 (&arr_iter, "BusNames",
         bus_connection_get_n_services_owned (stats_connection)) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakBusNames",
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakBusNames",
         bus_connection_get_peak_bus_names (stats_connection)) ||
-      !asv_add_string (&iter, &arr_iter, "UniqueName",
+      !_dbus_asv_add_string (&arr_iter, "UniqueName",
         bus_connection_get_name (stats_connection)))
-    goto oom;
+    {
+      _dbus_asv_abandon (&iter, &arr_iter);
+      goto oom;
+    }
 
   /* DBusConnection per-connection stats */
 
@@ -317,21 +190,24 @@ bus_stats_handle_get_connection_stats (DBusConnection *caller_connection,
                               &out_messages, &out_bytes, &out_fds,
                               &out_peak_bytes, &out_peak_fds);
 
-  if (!asv_add_uint32 (&iter, &arr_iter, "IncomingMessages", in_messages) ||
-      !asv_add_uint32 (&iter, &arr_iter, "IncomingBytes", in_bytes) ||
-      !asv_add_uint32 (&iter, &arr_iter, "IncomingFDs", in_fds) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakIncomingBytes", in_peak_bytes) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakIncomingFDs", in_peak_fds) ||
-      !asv_add_uint32 (&iter, &arr_iter, "OutgoingMessages", out_messages) ||
-      !asv_add_uint32 (&iter, &arr_iter, "OutgoingBytes", out_bytes) ||
-      !asv_add_uint32 (&iter, &arr_iter, "OutgoingFDs", out_fds) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakOutgoingBytes", out_peak_bytes) ||
-      !asv_add_uint32 (&iter, &arr_iter, "PeakOutgoingFDs", out_peak_fds))
-    goto oom;
+  if (!_dbus_asv_add_uint32 (&arr_iter, "IncomingMessages", in_messages) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "IncomingBytes", in_bytes) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "IncomingFDs", in_fds) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakIncomingBytes", in_peak_bytes) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakIncomingFDs", in_peak_fds) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "OutgoingMessages", out_messages) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "OutgoingBytes", out_bytes) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "OutgoingFDs", out_fds) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakOutgoingBytes", out_peak_bytes) ||
+      !_dbus_asv_add_uint32 (&arr_iter, "PeakOutgoingFDs", out_peak_fds))
+    {
+      _dbus_asv_abandon (&iter, &arr_iter);
+      goto oom;
+    }
 
   /* end */
 
-  if (!close_asv_reply (&iter, &arr_iter))
+  if (!_dbus_asv_close (&iter, &arr_iter))
     goto oom;
 
   if (!bus_transaction_send_from_driver (transaction, caller_connection,
@@ -344,6 +220,122 @@ bus_stats_handle_get_connection_stats (DBusConnection *caller_connection,
 oom:
   if (reply != NULL)
     dbus_message_unref (reply);
+
+  BUS_SET_OOM (error);
+  return FALSE;
+}
+
+
+dbus_bool_t
+bus_stats_handle_get_all_match_rules (DBusConnection *caller_connection,
+                                      BusTransaction *transaction,
+                                      DBusMessage    *message,
+                                      DBusError      *error)
+{
+  BusContext *context;
+  DBusString bus_name_str;
+  DBusMessage *reply = NULL;
+  DBusMessageIter iter, hash_iter, entry_iter, arr_iter;
+  BusRegistry *registry;
+  char **services = NULL;
+  int services_len;
+  DBusConnection *conn_filter = NULL;
+  BusMatchmaker *matchmaker;
+  int i;
+
+  _DBUS_ASSERT_ERROR_IS_CLEAR (error);
+
+  registry = bus_connection_get_registry (caller_connection);
+  context = bus_transaction_get_context (transaction);
+  matchmaker = bus_context_get_matchmaker (context);
+
+  if (!bus_registry_list_services (registry, &services, &services_len))
+    return FALSE;
+
+  reply = dbus_message_new_method_return (message);
+  if (reply == NULL)
+    goto oom;
+
+  dbus_message_iter_init_append (reply, &iter);
+
+  if (!dbus_message_iter_open_container (&iter, DBUS_TYPE_ARRAY, "{sas}",
+                                         &hash_iter))
+    goto oom;
+
+  for (i = 0 ; i < services_len ; i++)
+    {
+      BusService *service;
+
+      /* To avoid duplicate entries, only look for unique names */
+      if (services[i][0] != ':')
+        continue;
+
+      _dbus_string_init_const (&bus_name_str, services[i]);
+      service = bus_registry_lookup (registry, &bus_name_str);
+      _dbus_assert (service != NULL);
+
+      conn_filter = bus_service_get_primary_owners_connection (service);
+      _dbus_assert (conn_filter != NULL);
+
+      if (!dbus_message_iter_open_container (&hash_iter, DBUS_TYPE_DICT_ENTRY, NULL,
+                                             &entry_iter))
+        {
+          dbus_message_iter_abandon_container (&iter, &hash_iter);
+          goto oom;
+        }
+
+      if (!dbus_message_iter_append_basic (&entry_iter, DBUS_TYPE_STRING, &services[i]))
+        {
+          dbus_message_iter_abandon_container (&hash_iter, &entry_iter);
+          dbus_message_iter_abandon_container (&iter, &hash_iter);
+          goto oom;
+        }
+
+      if (!dbus_message_iter_open_container (&entry_iter, DBUS_TYPE_ARRAY, "s",
+                                             &arr_iter))
+        {
+          dbus_message_iter_abandon_container (&hash_iter, &entry_iter);
+          dbus_message_iter_abandon_container (&iter, &hash_iter);
+          goto oom;
+        }
+
+      if (!bus_match_rule_dump (matchmaker, conn_filter, &arr_iter))
+        {
+          dbus_message_iter_abandon_container (&entry_iter, &arr_iter);
+          dbus_message_iter_abandon_container (&hash_iter, &entry_iter);
+          dbus_message_iter_abandon_container (&iter, &hash_iter);
+          goto oom;
+        }
+
+      if (!dbus_message_iter_close_container (&entry_iter, &arr_iter))
+        {
+          dbus_message_iter_abandon_container (&hash_iter, &entry_iter);
+          dbus_message_iter_abandon_container (&iter, &hash_iter);
+          goto oom;
+        }
+      if (!dbus_message_iter_close_container (&hash_iter, &entry_iter))
+        {
+          dbus_message_iter_abandon_container (&iter, &hash_iter);
+          goto oom;
+        }
+    }
+
+  if (!dbus_message_iter_close_container (&iter, &hash_iter))
+    goto oom;
+
+  if (!bus_transaction_send_from_driver (transaction, caller_connection,
+                                         reply))
+    goto oom;
+
+  dbus_message_unref (reply);
+  dbus_free_string_array (services);
+  return TRUE;
+
+oom:
+  if (reply != NULL)
+    dbus_message_unref (reply);
+
+  dbus_free_string_array (services);
 
   BUS_SET_OOM (error);
   return FALSE;

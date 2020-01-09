@@ -38,6 +38,7 @@ typedef struct BusClientPolicy  BusClientPolicy;
 typedef struct BusPolicyRule    BusPolicyRule;
 typedef struct BusRegistry      BusRegistry;
 typedef struct BusSELinuxID     BusSELinuxID;
+typedef struct BusAppArmorConfinement BusAppArmorConfinement;
 typedef struct BusService       BusService;
 typedef struct BusOwner		BusOwner;
 typedef struct BusTransaction   BusTransaction;
@@ -54,6 +55,7 @@ typedef struct
   long max_message_unix_fds;        /**< Max number of unix fds of a single message*/
   int activation_timeout;           /**< How long to wait for an activation to time out */
   int auth_timeout;                 /**< How long to wait for an authentication to time out */
+  int pending_fd_timeout;           /**< How long to wait for a D-Bus message with a fd to time out */
   int max_completed_connections;    /**< Max number of authorized connections */
   int max_incomplete_connections;   /**< Max number of incomplete connections */
   int max_connections_per_user;     /**< Max number of connections auth'd as same user */
@@ -106,6 +108,7 @@ BusClientPolicy*  bus_context_create_client_policy               (BusContext    
                                                                   DBusError        *error);
 int               bus_context_get_activation_timeout             (BusContext       *context);
 int               bus_context_get_auth_timeout                   (BusContext       *context);
+int               bus_context_get_pending_fd_timeout             (BusContext       *context);
 int               bus_context_get_max_completed_connections      (BusContext       *context);
 int               bus_context_get_max_incomplete_connections     (BusContext       *context);
 int               bus_context_get_max_connections_per_user       (BusContext       *context);
@@ -114,10 +117,20 @@ int               bus_context_get_max_services_per_connection    (BusContext    
 int               bus_context_get_max_match_rules_per_connection (BusContext       *context);
 int               bus_context_get_max_replies_per_connection     (BusContext       *context);
 int               bus_context_get_reply_timeout                  (BusContext       *context);
+DBusRLimit *      bus_context_get_initial_fd_limit               (BusContext       *context);
 void              bus_context_log                                (BusContext       *context,
                                                                   DBusSystemLogSeverity severity,
                                                                   const char       *msg,
-                                                                  ...);
+                                                                  ...) _DBUS_GNUC_PRINTF (3, 4);
+void              bus_context_log_literal                        (BusContext       *context,
+                                                                  DBusSystemLogSeverity severity,
+                                                                  const char       *msg);
+void              bus_context_log_and_set_error                  (BusContext       *context,
+                                                                  DBusSystemLogSeverity severity,
+                                                                  DBusError        *error,
+                                                                  const char       *name,
+                                                                  const char       *msg,
+                                                                  ...) _DBUS_GNUC_PRINTF (5, 6);
 dbus_bool_t       bus_context_check_security_policy              (BusContext       *context,
                                                                   BusTransaction   *transaction,
                                                                   DBusConnection   *sender,
@@ -125,5 +138,6 @@ dbus_bool_t       bus_context_check_security_policy              (BusContext    
                                                                   DBusConnection   *proposed_recipient,
                                                                   DBusMessage      *message,
                                                                   DBusError        *error);
+void              bus_context_check_all_watches                  (BusContext       *context);
 
 #endif /* BUS_BUS_H */

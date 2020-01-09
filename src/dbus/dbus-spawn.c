@@ -38,6 +38,12 @@
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
+#ifdef HAVE_SYSTEMD
+#ifdef HAVE_SYSLOG_H
+#include <syslog.h>
+#endif
+#include <systemd/sd-journal.h>
+#endif
 
 extern char **environ;
 
@@ -174,6 +180,48 @@ read_pid (int        fd,
  * and the grandchild. The grandchild is our spawned process. The intermediate
  * child is a babysitter process; it keeps track of when the grandchild
  * exits/crashes, and reaps the grandchild.
+ *
+ * We automatically reap the babysitter process, killing it if necessary,
+ * when the DBusBabysitter's refcount goes to zero.
+ *
+ * Processes:
+ *
+ * main process
+ * | fork() A
+ * \- babysitter
+ *    | fork () B
+ *    \- grandchild     --> exec -->    spawned process
+ *
+ * IPC:
+ *                  child_err_report_pipe
+ *          /-----------<---------<--------------\
+ *          |                                    ^
+ *          v                                    |
+ * main process           babysitter          grandchild
+ *          ^                 ^
+ *          v                 v
+ *          \-------<->-------/
+ *            babysitter_pipe
+ *
+ * child_err_report_pipe is genuinely a pipe.
+ * The READ_END (also called error_pipe_from_child) is used in the main
+ * process. The WRITE_END (also called child_err_report_fd) is used in
+ * the grandchild process.
+ *
+ * On failure, the grandchild process sends CHILD_EXEC_FAILED + errno.
+ * On success, the pipe just closes (because it's close-on-exec) without
+ * sending any bytes.
+ *
+ * babysitter_pipe is mis-named: it's really a bidirectional socketpair.
+ * The [0] end (also called socket_to_babysitter) is used in the main
+ * process, the [1] end (also called parent_pipe) is used in the babysitter.
+ *
+ * If the fork() labelled B in the diagram above fails, the babysitter sends
+ * CHILD_FORK_FAILED + errno.
+ * On success, the babysitter sends CHILD_PID + the grandchild's pid.
+ * On SIGCHLD, the babysitter sends CHILD_EXITED + the exit status.
+ * The main process doesn't explicitly send anything, but when it exits,
+ * the babysitter gets POLLHUP or POLLERR.
  */
 
 /* Messages from children to parents */
@@ -192,9 +240,10 @@ struct DBusBabysitter
 {
   int refcount; /**< Reference count */
 
-  char *executable; /**< executable name to use in error messages */
+  char *log_name; /**< the name under which to log messages about this
+		    process being spawned */
   
-  int socket_to_babysitter; /**< Connection to the babysitter process */
+  DBusSocket socket_to_babysitter; /**< Connection to the babysitter process */
   int error_pipe_from_child; /**< Connection to the process that does the exec() */
   
   pid_t sitter_pid;  /**< PID Of the babysitter */
@@ -226,7 +275,7 @@ _dbus_babysitter_new (void)
 
   sitter->refcount = 1;
 
-  sitter->socket_to_babysitter = -1;
+  sitter->socket_to_babysitter.fd = -1;
   sitter->error_pipe_from_child = -1;
   
   sitter->sitter_pid = -1;
@@ -308,15 +357,18 @@ _dbus_babysitter_unref (DBusBabysitter *sitter)
           if (ret == 0)
             kill (sitter->sitter_pid, SIGKILL);
 
-        again:
           if (ret == 0)
-            ret = waitpid (sitter->sitter_pid, &status, 0);
+            {
+              do
+                {
+                  ret = waitpid (sitter->sitter_pid, &status, 0);
+                }
+              while (_DBUS_UNLIKELY (ret < 0 && errno == EINTR));
+            }
 
           if (ret < 0)
             {
-              if (errno == EINTR)
-                goto again;
-              else if (errno == ECHILD)
+              if (errno == ECHILD)
                 _dbus_warn ("Babysitter process not available to be reaped; should not happen\n");
               else
                 _dbus_warn ("Unexpected error %d in waitpid() for babysitter: %s\n",
@@ -343,7 +395,7 @@ _dbus_babysitter_unref (DBusBabysitter *sitter)
       if (sitter->watches)
         _dbus_watch_list_free (sitter->watches);
 
-      dbus_free (sitter->executable);
+      dbus_free (sitter->log_name);
       
       dbus_free (sitter);
     }
@@ -402,9 +454,25 @@ read_data (DBusBabysitter *sitter,
               {
                 if (what == CHILD_EXITED)
                   {
+                    /* Do not reset sitter->errnum to 0 here. We get here if
+                     * the babysitter reports that the grandchild process has
+                     * exited, and there are two ways that can happen:
+                     *
+                     * 1. grandchild successfully exec()s the desired process,
+                     * but then the desired process exits or is terminated
+                     * by a signal. The babysitter observes this and reports
+                     * CHILD_EXITED.
+                     *
+                     * 2. grandchild fails to exec() the desired process,
+                     * attempts to report the exec() failure (which
+                     * we will receive as CHILD_EXEC_FAILED), and then
+                     * exits itself (which will prompt the babysitter to
+                     * send CHILD_EXITED). We want the CHILD_EXEC_FAILED
+                     * to take precedence (and have its errno logged),
+                     * which _dbus_babysitter_set_child_exit_error() does.
+                     */
                     sitter->have_child_status = TRUE;
                     sitter->status = arg;
-                    sitter->errnum = 0;
                     _dbus_verbose ("recorded child status exited = %d signaled = %d exitstatus = %d termsig = %d\n",
                                    WIFEXITED (sitter->status), WIFSIGNALED (sitter->status),
                                    WEXITSTATUS (sitter->status), WTERMSIG (sitter->status));
@@ -470,10 +538,10 @@ close_socket_to_babysitter (DBusBabysitter *sitter)
       sitter->sitter_watch = NULL;
     }
 
-  if (sitter->socket_to_babysitter >= 0)
+  if (sitter->socket_to_babysitter.fd >= 0)
     {
       _dbus_close_socket (sitter->socket_to_babysitter, NULL);
-      sitter->socket_to_babysitter = -1;
+      sitter->socket_to_babysitter.fd = -1;
     }
 }
 
@@ -493,7 +561,7 @@ close_error_pipe_from_child (DBusBabysitter *sitter)
 
   if (sitter->error_pipe_from_child >= 0)
     {
-      _dbus_close_socket (sitter->error_pipe_from_child, NULL);
+      _dbus_close (sitter->error_pipe_from_child, NULL);
       sitter->error_pipe_from_child = -1;
     }
 }
@@ -509,7 +577,7 @@ handle_babysitter_socket (DBusBabysitter *sitter,
   if (revents & _DBUS_POLLIN)
     {
       _dbus_verbose ("Reading data from babysitter\n");
-      if (read_data (sitter, sitter->socket_to_babysitter) != READ_STATUS_OK)
+      if (read_data (sitter, sitter->socket_to_babysitter.fd) != READ_STATUS_OK)
         close_socket_to_babysitter (sitter);
     }
   else if (revents & (_DBUS_POLLERR | _DBUS_POLLHUP))
@@ -555,9 +623,9 @@ babysitter_iteration (DBusBabysitter *sitter,
       ++i;
     }
   
-  if (sitter->socket_to_babysitter >= 0)
+  if (sitter->socket_to_babysitter.fd >= 0)
     {
-      fds[i].fd = sitter->socket_to_babysitter;
+      fds[i].fd = sitter->socket_to_babysitter.fd;
       fds[i].events = _DBUS_POLLIN;
       fds[i].revents = 0;
       ++i;
@@ -591,7 +659,7 @@ babysitter_iteration (DBusBabysitter *sitter,
               --i;
               if (fds[i].fd == sitter->error_pipe_from_child)
                 handle_error_pipe (sitter, fds[i].revents);
-              else if (fds[i].fd == sitter->socket_to_babysitter)
+              else if (fds[i].fd == sitter->socket_to_babysitter.fd)
                 handle_babysitter_socket (sitter, fds[i].revents);
             }
         }
@@ -604,7 +672,7 @@ babysitter_iteration (DBusBabysitter *sitter,
  * Macro returns #TRUE if the babysitter still has live sockets open to the
  * babysitter child or the grandchild.
  */
-#define LIVE_CHILDREN(sitter) ((sitter)->socket_to_babysitter >= 0 || (sitter)->error_pipe_from_child >= 0)
+#define LIVE_CHILDREN(sitter) ((sitter)->socket_to_babysitter.fd >= 0 || (sitter)->error_pipe_from_child >= 0)
 
 /**
  * Blocks until the babysitter process gives us the PID of the spawned grandchild,
@@ -644,7 +712,7 @@ _dbus_babysitter_get_child_exited (DBusBabysitter *sitter)
     ;
 
   /* We will have exited the babysitter when the child has exited */
-  return sitter->socket_to_babysitter < 0;
+  return sitter->socket_to_babysitter.fd < 0;
 }
 
 /**
@@ -698,34 +766,34 @@ _dbus_babysitter_set_child_exit_error (DBusBabysitter *sitter,
     {
       dbus_set_error (error, DBUS_ERROR_SPAWN_EXEC_FAILED,
                       "Failed to execute program %s: %s",
-                      sitter->executable, _dbus_strerror (sitter->errnum));
+                      sitter->log_name, _dbus_strerror (sitter->errnum));
     }
   else if (sitter->have_fork_errnum)
     {
       dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
                       "Failed to fork a new process %s: %s",
-                      sitter->executable, _dbus_strerror (sitter->errnum));
+                      sitter->log_name, _dbus_strerror (sitter->errnum));
     }
   else if (sitter->have_child_status)
     {
       if (WIFEXITED (sitter->status))
         dbus_set_error (error, DBUS_ERROR_SPAWN_CHILD_EXITED,
                         "Process %s exited with status %d",
-                        sitter->executable, WEXITSTATUS (sitter->status));
+                        sitter->log_name, WEXITSTATUS (sitter->status));
       else if (WIFSIGNALED (sitter->status))
         dbus_set_error (error, DBUS_ERROR_SPAWN_CHILD_SIGNALED,
                         "Process %s received signal %d",
-                        sitter->executable, WTERMSIG (sitter->status));
+                        sitter->log_name, WTERMSIG (sitter->status));
       else
         dbus_set_error (error, DBUS_ERROR_FAILED,
                         "Process %s exited abnormally",
-                        sitter->executable);
+                        sitter->log_name);
     }
   else
     {
       dbus_set_error (error, DBUS_ERROR_FAILED,
                       "Process %s exited, reason unknown",
-                      sitter->executable);
+                      sitter->log_name);
     }
 }
 
@@ -778,7 +846,7 @@ handle_watch (DBusWatch       *watch,
 
   if (fd == sitter->error_pipe_from_child)
     handle_error_pipe (sitter, revents);
-  else if (fd == sitter->socket_to_babysitter)
+  else if (fd == sitter->socket_to_babysitter.fd)
     handle_babysitter_socket (sitter, revents);
 
   while (LIVE_CHILDREN (sitter) &&
@@ -787,7 +855,7 @@ handle_watch (DBusWatch       *watch,
 
   /* fd.o #32992: if the handle_* methods closed their sockets, they previously
    * didn't always remove the watches. Check that we don't regress. */
-  _dbus_assert (sitter->socket_to_babysitter != -1 || sitter->sitter_watch == NULL);
+  _dbus_assert (sitter->socket_to_babysitter.fd != -1 || sitter->sitter_watch == NULL);
   _dbus_assert (sitter->error_pipe_from_child != -1 || sitter->error_watch == NULL);
 
   if (_dbus_babysitter_get_child_exited (sitter) &&
@@ -807,9 +875,14 @@ handle_watch (DBusWatch       *watch,
 #define WRITE_END 1
 
 
-/* Avoids a danger in threaded situations (calling close()
- * on a file descriptor twice, and another thread has
- * re-opened it since the first close)
+/* Avoids a danger in re-entrant situations (calling close()
+ * on a file descriptor twice, and another module has
+ * re-opened it since the first close).
+ *
+ * This previously claimed to be relevant for threaded situations, but by
+ * trivial inspection, it is not thread-safe. It doesn't actually
+ * matter, since this module is only used in the -util variant of the
+ * library, which is only used in single-threaded situations.
  */
 static int
 close_and_invalidate (int *fd)
@@ -820,7 +893,7 @@ close_and_invalidate (int *fd)
     return -1;
   else
     {
-      ret = _dbus_close_socket (*fd, NULL);
+      ret = _dbus_close (*fd, NULL);
       *fd = -1;
     }
 
@@ -936,7 +1009,7 @@ do_exec (int                       child_err_report_fd,
 	 DBusSpawnChildSetupFunc   child_setup,
 	 void                     *user_data)
 {
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
   int i, max_open;
 #endif
 
@@ -947,7 +1020,7 @@ do_exec (int                       child_err_report_fd,
   if (child_setup)
     (* child_setup) (user_data);
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
   max_open = sysconf (_SC_OPEN_MAX);
   
   for (i = 3; i < max_open; i++)
@@ -960,7 +1033,7 @@ do_exec (int                       child_err_report_fd,
       retval = fcntl (i, F_GETFD);
 
       if (retval != -1 && !(retval & FD_CLOEXEC))
-	_dbus_warn ("Fd %d did not have the close-on-exec flag set!\n", i);
+        _dbus_warn ("Fd %d did not have the close-on-exec flag set!\n", i);
     }
 #endif
 
@@ -1115,8 +1188,7 @@ babysit (pid_t grandchild_pid,
 }
 
 /**
- * Spawns a new process. The executable name and argv[0]
- * are the same, both are provided in argv[0]. The child_setup
+ * Spawns a new process. The child_setup
  * function is passed the given user_data and is run in the child
  * just before calling exec().
  *
@@ -1126,8 +1198,9 @@ babysit (pid_t grandchild_pid,
  * If sitter_p is #NULL, no babysitter is kept.
  *
  * @param sitter_p return location for babysitter or #NULL
+ * @param log_name the name under which to log messages about this process being spawned
  * @param argv the executable and arguments
- * @param env the environment (not used on unix yet)
+ * @param env the environment, or #NULL to copy the parent's
  * @param child_setup function to call in child pre-exec()
  * @param user_data user data for setup function
  * @param error error object to be filled in if function fails
@@ -1135,6 +1208,7 @@ babysit (pid_t grandchild_pid,
  */
 dbus_bool_t
 _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
+                                   const char               *log_name,
                                    char                    **argv,
                                    char                    **env,
                                    DBusSpawnChildSetupFunc   child_setup,
@@ -1143,10 +1217,15 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
 {
   DBusBabysitter *sitter;
   int child_err_report_pipe[2] = { -1, -1 };
-  int babysitter_pipe[2] = { -1, -1 };
+  DBusSocket babysitter_pipe[2] = { DBUS_SOCKET_INIT, DBUS_SOCKET_INIT };
   pid_t pid;
+#ifdef HAVE_SYSTEMD
+  int fd_out = -1;
+  int fd_err = -1;
+#endif
   
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
+  _dbus_assert (argv[0] != NULL);
 
   if (sitter_p != NULL)
     *sitter_p = NULL;
@@ -1160,8 +1239,17 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
       return FALSE;
     }
 
-  sitter->executable = _dbus_strdup (argv[0]);
-  if (sitter->executable == NULL)
+  sitter->log_name = _dbus_strdup (log_name);
+  if (sitter->log_name == NULL && log_name != NULL)
+    {
+      dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
+      goto cleanup_and_fail;
+    }
+
+  if (sitter->log_name == NULL)
+    sitter->log_name = _dbus_strdup (argv[0]);
+
+  if (sitter->log_name == NULL)
     {
       dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
       goto cleanup_and_fail;
@@ -1170,7 +1258,7 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
   if (!make_pipe (child_err_report_pipe, error))
     goto cleanup_and_fail;
 
-  if (!_dbus_full_duplex_pipe (&babysitter_pipe[0], &babysitter_pipe[1], TRUE, error))
+  if (!_dbus_socketpair (&babysitter_pipe[0], &babysitter_pipe[1], TRUE, error))
     goto cleanup_and_fail;
 
   /* Setting up the babysitter is only useful in the parent,
@@ -1199,7 +1287,7 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
       goto cleanup_and_fail;
     }
       
-  sitter->sitter_watch = _dbus_watch_new (babysitter_pipe[0],
+  sitter->sitter_watch = _dbus_watch_new (babysitter_pipe[0].fd,
                                           DBUS_WATCH_READABLE,
                                           TRUE, handle_watch, sitter, NULL);
   if (sitter->sitter_watch == NULL)
@@ -1221,7 +1309,16 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
     }
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
-  
+
+#ifdef HAVE_SYSTEMD
+  /* This may fail, but it's not critical.
+   * In particular, if we were compiled with journald support but are now
+   * running on a non-systemd system, this is going to fail, so we
+   * have to cope gracefully. */
+  fd_out = sd_journal_stream_fd (sitter->log_name, LOG_INFO, FALSE);
+  fd_err = sd_journal_stream_fd (sitter->log_name, LOG_WARNING, FALSE);
+#endif
+
   pid = fork ();
   
   if (pid < 0)
@@ -1244,19 +1341,53 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
 
       /* Close the parent's end of the pipes. */
       close_and_invalidate (&child_err_report_pipe[READ_END]);
-      close_and_invalidate (&babysitter_pipe[0]);
+      close_and_invalidate (&babysitter_pipe[0].fd);
       
       /* Create the child that will exec () */
       grandchild_pid = fork ();
       
       if (grandchild_pid < 0)
 	{
-	  write_err_and_exit (babysitter_pipe[1],
+	  write_err_and_exit (babysitter_pipe[1].fd,
 			      CHILD_FORK_FAILED);
           _dbus_assert_not_reached ("Got to code after write_err_and_exit()");
 	}
       else if (grandchild_pid == 0)
-	{
+      {
+#ifdef __linux__
+          int fd = -1;
+
+#ifdef O_CLOEXEC
+          fd = open ("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
+#endif
+
+          if (fd < 0)
+            {
+              fd = open ("/proc/self/oom_score_adj", O_WRONLY);
+              _dbus_fd_set_close_on_exec (fd);
+            }
+
+          if (fd >= 0)
+            {
+              if (write (fd, "0", sizeof (char)) < 0)
+                _dbus_warn ("writing oom_score_adj error: %s\n", strerror (errno));
+              _dbus_close (fd, NULL);
+            }
+#endif
+          /* Go back to ignoring SIGPIPE, since it's evil
+           */
+          signal (SIGPIPE, SIG_IGN);
+
+          close_and_invalidate (&babysitter_pipe[1].fd);
+#ifdef HAVE_SYSTEMD
+	  /* log to systemd journal if possible */
+	  if (fd_out >= 0)
+            dup2 (fd_out, STDOUT_FILENO);
+	  if (fd_err >= 0)
+            dup2 (fd_err, STDERR_FILENO);
+          close_and_invalidate (&fd_out);
+          close_and_invalidate (&fd_err);
+#endif
 	  do_exec (child_err_report_pipe[WRITE_END],
 		   argv,
 		   env,
@@ -1265,7 +1396,12 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
 	}
       else
 	{
-          babysit (grandchild_pid, babysitter_pipe[1]);
+          close_and_invalidate (&child_err_report_pipe[WRITE_END]);
+#ifdef HAVE_SYSTEMD
+          close_and_invalidate (&fd_out);
+          close_and_invalidate (&fd_err);
+#endif
+          babysit (grandchild_pid, babysitter_pipe[1].fd);
           _dbus_assert_not_reached ("Got to code after babysit()");
 	}
     }
@@ -1273,10 +1409,14 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
     {      
       /* Close the uncared-about ends of the pipes */
       close_and_invalidate (&child_err_report_pipe[WRITE_END]);
-      close_and_invalidate (&babysitter_pipe[1]);
+      close_and_invalidate (&babysitter_pipe[1].fd);
+#ifdef HAVE_SYSTEMD
+      close_and_invalidate (&fd_out);
+      close_and_invalidate (&fd_err);
+#endif
 
       sitter->socket_to_babysitter = babysitter_pipe[0];
-      babysitter_pipe[0] = -1;
+      babysitter_pipe[0].fd = -1;
       
       sitter->error_pipe_from_child = child_err_report_pipe[READ_END];
       child_err_report_pipe[READ_END] = -1;
@@ -1301,8 +1441,12 @@ _dbus_spawn_async_with_babysitter (DBusBabysitter          **sitter_p,
   
   close_and_invalidate (&child_err_report_pipe[READ_END]);
   close_and_invalidate (&child_err_report_pipe[WRITE_END]);
-  close_and_invalidate (&babysitter_pipe[0]);
-  close_and_invalidate (&babysitter_pipe[1]);
+  close_and_invalidate (&babysitter_pipe[0].fd);
+  close_and_invalidate (&babysitter_pipe[1].fd);
+#ifdef HAVE_SYSTEMD
+  close_and_invalidate (&fd_out);
+  close_and_invalidate (&fd_err);
+#endif
 
   if (sitter != NULL)
     _dbus_babysitter_unref (sitter);
@@ -1321,7 +1465,7 @@ _dbus_babysitter_set_result_function  (DBusBabysitter             *sitter,
 
 /** @} */
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 
 static char *
 get_test_exec (const char *exe,
@@ -1364,7 +1508,7 @@ check_spawn_nonexistent (void *data)
   /*** Test launching nonexistent binary */
   
   argv[0] = "/this/does/not/exist/32542sdgafgafdg";
-  if (_dbus_spawn_async_with_babysitter (&sitter, argv,
+  if (_dbus_spawn_async_with_babysitter (&sitter, "spawn_nonexistent", argv,
                                          NULL, NULL, NULL,
                                          &error))
     {
@@ -1413,7 +1557,7 @@ check_spawn_segfault (void *data)
       return TRUE;
     }
 
-  if (_dbus_spawn_async_with_babysitter (&sitter, argv,
+  if (_dbus_spawn_async_with_babysitter (&sitter, "spawn_segfault", argv,
                                          NULL, NULL, NULL,
                                          &error))
     {
@@ -1464,7 +1608,7 @@ check_spawn_exit (void *data)
       return TRUE;
     }
 
-  if (_dbus_spawn_async_with_babysitter (&sitter, argv,
+  if (_dbus_spawn_async_with_babysitter (&sitter, "spawn_exit", argv,
                                          NULL, NULL, NULL,
                                          &error))
     {
@@ -1515,7 +1659,7 @@ check_spawn_and_kill (void *data)
       return TRUE;
     }
 
-  if (_dbus_spawn_async_with_babysitter (&sitter, argv,
+  if (_dbus_spawn_async_with_babysitter (&sitter, "spawn_and_kill", argv,
                                          NULL, NULL, NULL,
                                          &error))
     {

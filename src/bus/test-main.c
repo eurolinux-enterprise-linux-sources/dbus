@@ -31,7 +31,11 @@
 #include <dbus/dbus-message-internal.h>
 #include "selinux.h"
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_UNIX
+# include <dbus/dbus-sysdeps-unix.h>
+#endif
+
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 static void
 die (const char *failure)
 {
@@ -52,7 +56,7 @@ check_memleaks (const char *name)
       die ("memleaks");
     }
 }
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */
 
 static DBusInitialFDs *initial_fds = NULL;
 
@@ -84,14 +88,14 @@ test_post_hook (void)
 int
 main (int argc, char **argv)
 {
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
   const char *dir;
   const char *only;
   DBusString test_data_dir;
 
   progname = argv[0];
 
-  if (argc > 1)
+  if (argc > 1 && strcmp (argv[1], "--tap") != 0)
     dir = argv[1];
   else
     dir = _dbus_getenv ("DBUS_TEST_DATA");
@@ -108,6 +112,11 @@ main (int argc, char **argv)
     }
 
   _dbus_string_init_const (&test_data_dir, dir);
+
+#ifdef DBUS_UNIX
+  /* close any inherited fds so dbus-spawn's check for close-on-exec works */
+  _dbus_close_all ();
+#endif
 
   if (!_dbus_threads_init_debug ())
     die ("initializing debug threads");
@@ -181,7 +190,7 @@ main (int argc, char **argv)
 
   
   return 0;
-#else /* DBUS_BUILD_TESTS */
+#else /* DBUS_ENABLE_EMBEDDED_TESTS */
 
   printf ("Not compiled with test support\n");
   

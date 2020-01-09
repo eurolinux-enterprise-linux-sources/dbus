@@ -34,11 +34,14 @@
 #include "config-parser.h"
 #include "signals.h"
 #include "selinux.h"
+#include "apparmor.h"
+#include "audit.h"
 #include "dir-watch.h"
 #include <dbus/dbus-list.h>
 #include <dbus/dbus-hash.h>
 #include <dbus/dbus-credentials.h>
 #include <dbus/dbus-internals.h>
+#include <dbus/dbus-server-protected.h>
 
 #ifdef DBUS_CYGWIN
 #include <signal.h>
@@ -63,11 +66,13 @@ struct BusContext
   BusPolicy *policy;
   BusMatchmaker *matchmaker;
   BusLimits limits;
+  DBusRLimit *initial_fd_limit;
   unsigned int fork : 1;
   unsigned int syslog : 1;
   unsigned int keep_umask : 1;
   unsigned int allow_anonymous : 1;
   unsigned int systemd_activation : 1;
+  dbus_bool_t watches_enabled;
 };
 
 static dbus_int32_t server_data_slot = -1;
@@ -287,7 +292,7 @@ process_config_first_time_only (BusContext       *context,
   auth_mechanisms = NULL;
   pidfile = NULL;
 
-  _dbus_init_system_log ();
+  _dbus_init_system_log (TRUE);
 
   if (flags & BUS_CONTEXT_FLAG_SYSTEMD_ACTIVATION)
     context->systemd_activation = TRUE;
@@ -526,6 +531,18 @@ process_config_every_time (BusContext      *context,
   context->policy = bus_config_parser_steal_policy (parser);
   _dbus_assert (context->policy != NULL);
 
+  /* context->connections is NULL when creating new BusContext */
+  if (context->connections)
+    {
+      _dbus_verbose ("Reload policy rules for completed connections\n");
+      retval = bus_connections_reload_policy (context->connections, error);
+      if (!retval)
+        {
+          _DBUS_ASSERT_ERROR_IS_SET (error);
+          goto failed;
+        }
+    }
+
   /* We have to build the address backward, so that
    * <listen> later in the config file have priority
    */
@@ -645,19 +662,38 @@ oom:
 static void
 raise_file_descriptor_limit (BusContext      *context)
 {
+#ifdef DBUS_UNIX
+  DBusError error = DBUS_ERROR_INIT;
 
-  /* I just picked this out of thin air; we need some extra
-   * descriptors for things like any internal pipes we create,
-   * inotify, connections to SELinux, etc.
+  /* we only do this once */
+  if (context->initial_fd_limit != NULL)
+    return;
+
+  context->initial_fd_limit = _dbus_rlimit_save_fd_limit (&error);
+
+  if (context->initial_fd_limit == NULL)
+    {
+      bus_context_log (context, DBUS_SYSTEM_LOG_WARNING,
+                       "%s: %s", error.name, error.message);
+      dbus_error_free (&error);
+      return;
+    }
+
+  /* We used to compute a suitable rlimit based on the configured number
+   * of connections, but that breaks down as soon as we allow fd-passing,
+   * because each connection is allowed to pass 64 fds to us, and if
+   * they all did, we'd hit kernel limits. We now hard-code 64k as a
+   * good limit, like systemd does: that's enough to avoid DoS from
+   * anything short of multiple uids conspiring against us.
    */
-  unsigned int arbitrary_extra_fds = 32;
-  unsigned int limit;
-
-  limit = context->limits.max_completed_connections +
-    context->limits.max_incomplete_connections
-    + arbitrary_extra_fds;
-
-  _dbus_request_file_descriptor_limit (limit);
+  if (!_dbus_rlimit_raise_fd_limit_if_privileged (65536, &error))
+    {
+      bus_context_log (context, DBUS_SYSTEM_LOG_WARNING,
+                       "%s: %s", error.name, error.message);
+      dbus_error_free (&error);
+      return;
+    }
+#endif
 }
 
 static dbus_bool_t
@@ -731,7 +767,8 @@ bus_context_new (const DBusString *config_file,
     }
   context->refcount = 1;
 
-  _dbus_generate_uuid (&context->uuid);
+  if (!_dbus_generate_uuid (&context->uuid, error))
+    goto failed;
 
   if (!_dbus_string_copy_data (config_file, &context->config_file))
     {
@@ -745,6 +782,8 @@ bus_context_new (const DBusString *config_file,
       BUS_SET_OOM (error);
       goto failed;
     }
+
+  context->watches_enabled = TRUE;
 
   context->registry = bus_registry_new (context);
   if (context->registry == NULL)
@@ -892,11 +931,51 @@ bus_context_new (const DBusString *config_file,
       !_dbus_pipe_is_stdout_or_stderr (print_pid_pipe))
     _dbus_pipe_close (print_pid_pipe, NULL);
 
-  if (!bus_selinux_full_init ())
+  /* Here we change our credentials if required,
+   * as soon as we've set up our sockets and pidfile.
+   * This must be done before initializing LSMs, so that the netlink
+   * monitoring thread started by avc_init() will not lose CAP_AUDIT_WRITE
+   * when the main thread calls setuid().
+   * https://bugs.freedesktop.org/show_bug.cgi?id=92832
+   */
+  if (context->user != NULL)
     {
-      bus_context_log (context, DBUS_SYSTEM_LOG_FATAL, "SELinux enabled but AVC initialization failed; check system log\n");
+      if (!_dbus_change_to_daemon_user (context->user, error))
+	{
+	  _DBUS_ASSERT_ERROR_IS_SET (error);
+	  goto failed;
+	}
     }
 
+  /* Auditing should be initialized before LSMs, so that the LSMs are able
+   * to log audit-events that happen during their initialization.
+   */
+  bus_audit_init (context);
+
+  if (!bus_selinux_full_init ())
+    {
+      bus_context_log (context, DBUS_SYSTEM_LOG_FATAL, "SELinux enabled but D-Bus initialization failed; check system log\n");
+    }
+
+  if (!bus_apparmor_full_init (error))
+    {
+      _DBUS_ASSERT_ERROR_IS_SET (error);
+      goto failed;
+    }
+
+  if (bus_apparmor_enabled ())
+    {
+      /* Only print AppArmor mediation message when syslog support is enabled */
+      if (context->syslog)
+        bus_context_log (context, DBUS_SYSTEM_LOG_INFO,
+                         "AppArmor D-Bus mediation is enabled\n");
+    }
+
+  /* When SELinux is used, this must happen after bus_selinux_full_init()
+   * so that it has access to the access vector cache, which is required
+   * to process <associate/> elements.
+   * http://lists.freedesktop.org/archives/dbus/2008-October/010491.html
+   */
   if (!process_config_postinit (context, parser, error))
     {
       _DBUS_ASSERT_ERROR_IS_SET (error);
@@ -907,23 +986,6 @@ bus_context_new (const DBusString *config_file,
     {
       bus_config_parser_unref (parser);
       parser = NULL;
-    }
-
-  /* Here we change our credentials if required,
-   * as soon as we've set up our sockets and pidfile
-   */
-  if (context->user != NULL)
-    {
-      if (!_dbus_change_to_daemon_user (context->user, error))
-	{
-	  _DBUS_ASSERT_ERROR_IS_SET (error);
-	  goto failed;
-	}
-
-#ifdef HAVE_SELINUX
-      /* FIXME - why not just put this in full_init() below? */
-      bus_selinux_audit_init ();
-#endif
     }
 
   dbus_server_free_data_slot (&server_data_slot);
@@ -1114,6 +1176,10 @@ bus_context_unref (BusContext *context)
 
           dbus_free (context->pidfile);
 	}
+
+      if (context->initial_fd_limit)
+        _dbus_rlimit_free (context->initial_fd_limit);
+
       dbus_free (context);
 
       dbus_server_free_data_slot (&server_data_slot);
@@ -1225,6 +1291,12 @@ bus_context_get_auth_timeout (BusContext *context)
 }
 
 int
+bus_context_get_pending_fd_timeout (BusContext *context)
+{
+  return context->limits.pending_fd_timeout;
+}
+
+int
 bus_context_get_max_completed_connections (BusContext *context)
 {
   return context->limits.max_completed_connections;
@@ -1272,8 +1344,11 @@ bus_context_get_reply_timeout (BusContext *context)
   return context->limits.reply_timeout;
 }
 
-void
-bus_context_log (BusContext *context, DBusSystemLogSeverity severity, const char *msg, ...) _DBUS_GNUC_PRINTF (3, 4);
+DBusRLimit *
+bus_context_get_initial_fd_limit (BusContext *context)
+{
+  return context->initial_fd_limit;
+}
 
 void
 bus_context_log (BusContext *context, DBusSystemLogSeverity severity, const char *msg, ...)
@@ -1287,6 +1362,10 @@ bus_context_log (BusContext *context, DBusSystemLogSeverity severity, const char
       vfprintf (stderr, msg, args);
       fprintf (stderr, "\n");
       va_end (args);
+
+      if (severity == DBUS_SYSTEM_LOG_FATAL)
+        _dbus_exit (1);
+
       return;
     }
 
@@ -1319,6 +1398,49 @@ nonnull (const char *maybe_null,
          const char *if_null)
 {
   return (maybe_null ? maybe_null : if_null);
+}
+
+void
+bus_context_log_literal (BusContext            *context,
+                         DBusSystemLogSeverity  severity,
+                         const char            *msg)
+{
+  if (!context->syslog)
+    {
+      fputs (msg, stderr);
+      fputc ('\n', stderr);
+
+      if (severity == DBUS_SYSTEM_LOG_FATAL)
+        _dbus_exit (1);
+    }
+  else
+    {
+      _dbus_system_log (severity, "%s%s", nonnull (context->log_prefix, ""),
+                        msg);
+    }
+}
+
+void
+bus_context_log_and_set_error (BusContext            *context,
+                               DBusSystemLogSeverity  severity,
+                               DBusError             *error,
+                               const char            *name,
+                               const char            *msg,
+                               ...)
+{
+  DBusError stack_error = DBUS_ERROR_INIT;
+  va_list args;
+
+  va_start (args, msg);
+  _dbus_set_error_valist (&stack_error, name, msg, args);
+  va_end (args);
+
+  /* If we hit OOM while setting the error, this will syslog "out of memory"
+   * which is itself an indication that something is seriously wrong */
+  bus_context_log_literal (context, DBUS_SYSTEM_LOG_SECURITY,
+                           stack_error.message);
+
+  dbus_move_error (&stack_error, error);
 }
 
 /*
@@ -1379,7 +1501,7 @@ complain_about_message (BusContext     *context,
   /* If we hit OOM while setting the error, this will syslog "out of memory"
    * which is itself an indication that something is seriously wrong */
   if (log)
-    bus_context_log (context, DBUS_SYSTEM_LOG_SECURITY, "%s",
+    bus_context_log_literal (context, DBUS_SYSTEM_LOG_SECURITY,
         stack_error.message);
 
   dbus_move_error (&stack_error, error);
@@ -1407,7 +1529,7 @@ bus_context_check_security_policy (BusContext     *context,
                                    DBusMessage    *message,
                                    DBusError      *error)
 {
-  const char *dest;
+  const char *src, *dest;
   BusClientPolicy *sender_policy;
   BusClientPolicy *recipient_policy;
   dbus_int32_t toggles;
@@ -1416,6 +1538,7 @@ bus_context_check_security_policy (BusContext     *context,
   dbus_bool_t requested_reply;
 
   type = dbus_message_get_type (message);
+  src = dbus_message_get_sender (message);
   dest = dbus_message_get_destination (message);
 
   /* dispatch.c was supposed to ensure these invariants */
@@ -1448,30 +1571,6 @@ bus_context_check_security_policy (BusContext     *context,
 
   if (sender != NULL)
     {
-      /* First verify the SELinux access controls.  If allowed then
-       * go on with the standard checks.
-       */
-      if (!bus_selinux_allows_send (sender, proposed_recipient,
-				    dbus_message_type_to_string (dbus_message_get_type (message)),
-				    dbus_message_get_interface (message),
-				    dbus_message_get_member (message),
-				    dbus_message_get_error_name (message),
-				    dest ? dest : DBUS_SERVICE_DBUS, error))
-        {
-          if (error != NULL && !dbus_error_is_set (error))
-            {
-              /* don't syslog this, just set the error: avc_has_perm should
-               * have already written to either the audit log or syslog */
-              complain_about_message (context, DBUS_ERROR_ACCESS_DENIED,
-                  "An SELinux policy prevents this sender from sending this "
-                  "message to this recipient",
-                  0, message, sender, proposed_recipient, FALSE, FALSE, error);
-              _dbus_verbose ("SELinux security check denying send to service\n");
-            }
-
-          return FALSE;
-        }
-
       if (bus_connection_is_active (sender))
         {
           sender_policy = bus_connection_get_policy (sender);
@@ -1501,6 +1600,51 @@ bus_context_check_security_policy (BusContext     *context,
             }
         }
       else
+        {
+          sender_policy = NULL;
+        }
+
+      /* First verify the SELinux access controls.  If allowed then
+       * go on with the standard checks.
+       */
+      if (!bus_selinux_allows_send (sender, proposed_recipient,
+				    dbus_message_type_to_string (dbus_message_get_type (message)),
+				    dbus_message_get_interface (message),
+				    dbus_message_get_member (message),
+				    dbus_message_get_error_name (message),
+				    dest ? dest : DBUS_SERVICE_DBUS, error))
+        {
+          if (error != NULL && !dbus_error_is_set (error))
+            {
+              /* don't syslog this, just set the error: avc_has_perm should
+               * have already written to either the audit log or syslog */
+              complain_about_message (context, DBUS_ERROR_ACCESS_DENIED,
+                  "An SELinux policy prevents this sender from sending this "
+                  "message to this recipient",
+                  0, message, sender, proposed_recipient, FALSE, FALSE, error);
+              _dbus_verbose ("SELinux security check denying send to service\n");
+            }
+
+          return FALSE;
+        }
+
+      /* next verify AppArmor access controls.  If allowed then
+       * go on with the standard checks.
+       */
+      if (!bus_apparmor_allows_send (sender, proposed_recipient,
+                                     requested_reply,
+                                     bus_context_get_type (context),
+                                     dbus_message_get_type (message),
+                                     dbus_message_get_path (message),
+                                     dbus_message_get_interface (message),
+                                     dbus_message_get_member (message),
+                                     dbus_message_get_error_name (message),
+                                     dest ? dest : DBUS_SERVICE_DBUS,
+                                     src ? src : DBUS_SERVICE_DBUS,
+                                     error))
+        return FALSE;
+
+      if (!bus_connection_is_active (sender))
         {
           /* Policy for inactive connections is that they can only send
            * the hello message to the bus driver
@@ -1608,7 +1752,7 @@ bus_context_check_security_policy (BusContext     *context,
       complain_about_message (context, DBUS_ERROR_ACCESS_DENIED,
           "Rejected receive message", toggles,
           message, sender, proposed_recipient, requested_reply,
-          (addressed_recipient == proposed_recipient), NULL);
+          (addressed_recipient == proposed_recipient), error);
       _dbus_verbose ("security policy disallowing message due to recipient policy\n");
       return FALSE;
     }
@@ -1645,4 +1789,37 @@ bus_context_check_security_policy (BusContext     *context,
 
   _dbus_verbose ("security policy allowing message\n");
   return TRUE;
+}
+
+void
+bus_context_check_all_watches (BusContext *context)
+{
+  DBusList *link;
+  dbus_bool_t enabled = TRUE;
+
+  if (bus_connections_get_n_incomplete (context->connections) >=
+      bus_context_get_max_incomplete_connections (context))
+    {
+      enabled = FALSE;
+    }
+
+  if (context->watches_enabled == enabled)
+    return;
+
+  context->watches_enabled = enabled;
+
+  for (link = _dbus_list_get_first_link (&context->servers);
+       link != NULL;
+       link = _dbus_list_get_next_link (&context->servers, link))
+    {
+      /* A BusContext might contains several DBusServer (if there are
+       * several <listen> configuration items) and a DBusServer might
+       * contain several DBusWatch in its DBusWatchList (if getaddrinfo
+       * returns several addresses on a dual IPv4-IPv6 stack or if
+       * systemd passes several fds).
+       * We want to enable/disable them all.
+       */
+      DBusServer *server = link->data;
+      _dbus_server_toggle_all_watches (server, enabled);
+    }
 }

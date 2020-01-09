@@ -1,16 +1,29 @@
 
-configdir=$(sysconfdir)/dbus-1
+dbusdatadir=$(datadir)/dbus-1
 
 AM_CPPFLAGS = \
 	-I$(top_builddir) \
 	-I$(top_srcdir) \
+	$(DBUS_STATIC_BUILD_CPPFLAGS) \
 	$(SYSTEMD_CFLAGS) \
 	$(VALGRIND_CFLAGS) \
 	-DDBUS_COMPILATION \
 	-DDBUS_MACHINE_UUID_FILE=\""$(localstatedir)/lib/dbus/machine-id"\" \
-	-DDBUS_SYSTEM_CONFIG_FILE=\""$(configdir)/system.conf"\" \
-	-DDBUS_SESSION_CONFIG_FILE=\""$(configdir)/session.conf"\" \
+	-DDBUS_SYSTEM_CONFIG_FILE=\""$(dbusdatadir)/system.conf"\" \
+	-DDBUS_SESSION_CONFIG_FILE=\""$(dbusdatadir)/session.conf"\" \
 	$(NULL)
+
+AM_CFLAGS =
+
+if HAVE_VISIBILITY
+if !DBUS_WIN
+AM_CFLAGS += $(CFLAG_VISIBILITY)
+AM_CPPFLAGS += \
+	-DDBUS_EXPORT='__attribute__((__visibility__("default")))' \
+	-DDBUS_PRIVATE_EXPORT='__attribute__((__visibility__("default")))' \
+	$(NULL)
+endif
+endif
 
 # if assertions are enabled, improve backtraces
 AM_LDFLAGS = @R_DYNAMIC_LDFLAG@
@@ -35,16 +48,13 @@ dbus_res_ldflag = -Wl,$(dbus_res)
 no_undefined = -no-undefined
 export_symbols =
 
-libdbus_1_la_DEPENDENCIES = $(dbus_res)
+EXTRA_libdbus_1_la_DEPENDENCIES = $(dbus_res)
 intllibs =
 
 else
 dbus_res =
 dbus_res_ldflag =
 no_undefined =
-## don't export symbols that start with "_" (we use this
-## convention for internal symbols)
-export_symbols = -export-symbols-regex "^[^_].*"
 
 intllibs = @LTLIBINTL@
 
@@ -104,8 +114,7 @@ DBUS_SHARED_arch_sources = 			\
 	dbus-transport-unix.h			\
 	dbus-userdb.c				\
 	dbus-userdb.h 				\
-	sd-daemon.c                             \
-	sd-daemon.h
+	$(NULL)
 
 DBUS_UTIL_arch_sources = 			\
 	dbus-sysdeps-util-unix.c		\
@@ -233,6 +242,8 @@ DBUS_SHARED_SOURCES=				\
 ### should be underscore-prefixed but don't really need
 ### to be unless they move to DBUS_SHARED_SOURCES later)
 DBUS_UTIL_SOURCES=				\
+	dbus-asv-util.c				\
+	dbus-asv-util.h				\
 	dbus-auth-script.c			\
 	dbus-auth-script.h			\
 	dbus-auth-util.c			\
@@ -262,51 +273,56 @@ libdbus_1_la_SOURCES=				\
 	$(DBUS_SHARED_SOURCES)
 
 libdbus_internal_la_SOURCES=			\
-	$(DBUS_LIB_SOURCES)			\
-	$(DBUS_SHARED_SOURCES)			\
 	$(DBUS_UTIL_SOURCES)
 
 BUILT_SOURCES=$(nodist_dbusarchinclude_HEADERS)
 EXTRA_DIST=dbus-arch-deps.h.in
 
-## this library is the same as libdbus, but exports all the symbols
-## and is only used for static linking within the dbus package.
 noinst_LTLIBRARIES=libdbus-internal.la
 
 libdbus_1_la_CPPFLAGS = \
 	$(AM_CPPFLAGS) \
 	-Ddbus_1_EXPORTS \
 	$(NULL)
+
+if HAVE_LD_VERSION_SCRIPT
+SYMBOL_EXPORT_LDFLAGS=-Wl,--version-script=Version
+else
+SYMBOL_EXPORT_LDFLAGS=
+endif
+
 libdbus_1_la_LIBADD= $(LIBDBUS_LIBS)
 libdbus_1_la_LDFLAGS = \
 	$(AM_LDFLAGS) \
-	$(export_symbols) \
 	-version-info $(LT_CURRENT):$(LT_REVISION):$(LT_AGE) \
+	$(SYMBOL_EXPORT_LDFLAGS) \
 	-no-undefined \
 	$(NULL)
 
-libdbus_internal_la_CPPFLAGS = \
-	$(AM_CPPFLAGS) \
-	-DDBUS_STATIC_BUILD \
-	$(NULL)
-libdbus_internal_la_LIBADD=$(LIBDBUS_LIBS) $(SYSTEMD_LIBS)
+libdbus_internal_la_LIBADD=$(LIBDBUS_LIBS) libdbus-1.la
+
+if DBUS_WIN
+# This must be a separate convenience library, otherwise libtool notices
+# that libdbus-1 might contain C++, links it with g++ and links in libstdc++,
+# even on Unix where in fact it doesn't contain any C++. For Windows, where
+# this code is used, we don't actually need libstdc++.
+noinst_LTLIBRARIES += libdbus-init-win.la
+libdbus_init_win_la_SOURCES = dbus-init-win.cpp
+libdbus_1_la_LIBADD += libdbus-init-win.la
+endif
 
 noinst_PROGRAMS =
 
-if DBUS_BUILD_TESTS
+if DBUS_ENABLE_EMBEDDED_TESTS
 # We can't actually run this til we've reached test/
-noinst_PROGRAMS += dbus-test
+noinst_PROGRAMS += test-dbus
 endif
 
-dbus_test_SOURCES=				\
+test_dbus_SOURCES=				\
 	dbus-test-main.c
 
-dbus_test_LDADD = libdbus-internal.la
+test_dbus_LDADD = libdbus-internal.la
 
 ## mop up the gcov files
 clean-local:
 	/bin/rm *.bb *.bbg *.da *.gcov .libs/*.da .libs/*.bbg || true
-
-update-systemd:
-	curl http://cgit.freedesktop.org/systemd/plain/src/sd-daemon.c > sd-daemon.c
-	curl http://cgit.freedesktop.org/systemd/plain/src/sd-daemon.h > sd-daemon.h

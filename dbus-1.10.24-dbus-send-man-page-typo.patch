@@ -1,0 +1,27 @@
+From b98c85f2803434eec3192cdc3e9e86425fe33428 Mon Sep 17 00:00:00 2001
+From: David King <dking@redhat.com>
+Date: Tue, 3 Oct 2017 13:34:03 +0100
+Subject: [PATCH] doc: Fix dbus-send.1 uint16 typo
+
+https://bugs.freedesktop.org/show_bug.cgi?id=103075
+https://bugzilla.redhat.com/show_bug.cgi?id=1467415
+---
+ doc/dbus-send.1.xml.in | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/doc/dbus-send.1.xml.in b/doc/dbus-send.1.xml.in
+index 67b6dfd2..271435ca 100644
+--- a/doc/dbus-send.1.xml.in
++++ b/doc/dbus-send.1.xml.in
+@@ -65,7 +65,7 @@ may include containers (arrays, dicts, and variants) as described below.</para>
+ &lt;array&gt;      ::= array:&lt;type&gt;:&lt;value&gt;[,&lt;value&gt;...]
+ &lt;dict&gt;       ::= dict:&lt;type&gt;:&lt;type&gt;:&lt;key&gt;,&lt;value&gt;[,&lt;key&gt;,&lt;value&gt;...]
+ &lt;variant&gt;    ::= variant:&lt;type&gt;:&lt;value&gt;
+-&lt;type&gt;       ::= string | int16 | uint 16 | int32 | uint32 | int64 | uint64 | double | byte | boolean | objpath
++&lt;type&gt;       ::= string | int16 | uint16 | int32 | uint32 | int64 | uint64 | double | byte | boolean | objpath
+ </literallayout> <!-- .fi -->
+ 
+ <para>D-Bus supports more types than these, but <command>dbus-send</command> currently
+-- 
+2.13.6
+

@@ -27,20 +27,9 @@
 
 #include <config.h>
 
-#include <glib.h>
-
-#include <dbus/dbus.h>
-#include <dbus/dbus-glib-lowlevel.h>
-
 #include <string.h>
 
-#ifdef DBUS_WIN
-# include <io.h>
-# include <windows.h>
-#else
-# include <signal.h>
-# include <unistd.h>
-#endif
+#include "test-utils-glib.h"
 
 #define SENDER_NAME "test.eavesdrop.sender"
 #define SENDER_PATH "/test/eavesdrop/sender"
@@ -71,6 +60,7 @@ typedef enum {
 } SignalDst;
 
 typedef struct {
+    TestMainContext *ctx;
     DBusError e;
     GError *ge;
 
@@ -88,96 +78,6 @@ typedef struct {
     SignalDst politelistener_dst;
     dbus_bool_t politelistener_got_stopper;
 } Fixture;
-
-#define assert_no_error(e) _assert_no_error (e, __FILE__, __LINE__)
-static void
-_assert_no_error (const DBusError *e,
-    const char *file,
-    int line)
-{
-  if (G_UNLIKELY (dbus_error_is_set (e)))
-    g_error ("%s:%d: expected success but got error: %s: %s",
-        file, line, e->name, e->message);
-}
-
-static gchar *
-spawn_dbus_daemon (gchar *binary,
-    gchar *configuration,
-    GPid *daemon_pid)
-{
-  GError *error = NULL;
-  GString *address;
-  gint address_fd;
-  gchar *argv[] = {
-      binary,
-      configuration,
-      "--nofork",
-      "--print-address=1", /* stdout */
-      NULL
-  };
-
-  g_spawn_async_with_pipes (NULL, /* working directory */
-      argv,
-      NULL, /* envp */
-      G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH,
-      NULL, /* child_setup */
-      NULL, /* user data */
-      daemon_pid,
-      NULL, /* child's stdin = /dev/null */
-      &address_fd,
-      NULL, /* child's stderr = our stderr */
-      &error);
-  g_assert_no_error (error);
-
-  address = g_string_new (NULL);
-
-  /* polling until the dbus-daemon writes out its address is a bit stupid,
-   * but at least it's simple, unlike dbus-launch... in principle we could
-   * use select() here, but life's too short */
-  while (1)
-    {
-      gssize bytes;
-      gchar buf[4096];
-      gchar *newline;
-
-      bytes = read (address_fd, buf, sizeof (buf));
-
-      if (bytes > 0)
-        g_string_append_len (address, buf, bytes);
-
-      newline = strchr (address->str, '\n');
-
-      if (newline != NULL)
-        {
-          g_string_truncate (address, newline - address->str);
-          break;
-        }
-
-      g_usleep (G_USEC_PER_SEC / 10);
-    }
-
-  return g_string_free (address, FALSE);
-}
-
-static DBusConnection *
-connect_to_bus (const gchar *address)
-{
-  DBusConnection *conn;
-  DBusError error = DBUS_ERROR_INIT;
-  dbus_bool_t ok;
-
-  conn = dbus_connection_open_private (address, &error);
-  assert_no_error (&error);
-  g_assert (conn != NULL);
-
-  ok = dbus_bus_register (conn, &error);
-  assert_no_error (&error);
-  g_assert (ok);
-  g_assert (dbus_bus_get_unique_name (conn) != NULL);
-
-  dbus_connection_setup_with_g_main (conn, NULL);
-  return conn;
-}
 
 /* send a unicast signal to <self> to ensure that no other connection
  * listening is the actual recipient for the signal */
@@ -333,9 +233,9 @@ add_receiver_filter (Fixture *f)
   DBusError e = DBUS_ERROR_INIT;
 
   dbus_bus_add_match (f->receiver, RECEIVER_RULE, &e);
-  assert_no_error (&e);
+  test_assert_no_error (&e);
   dbus_bus_add_match (f->receiver, STOPPER_RULE, &e);
-  assert_no_error (&e);
+  test_assert_no_error (&e);
 
   if (!dbus_connection_add_filter (f->receiver,
         signal_filter, f, NULL))
@@ -348,9 +248,9 @@ add_eavesdropper_filter (Fixture *f)
   DBusError e = DBUS_ERROR_INIT;
 
   dbus_bus_add_match (f->eavesdropper, EAVESDROPPER_RULE, &e);
-  assert_no_error (&e);
+  test_assert_no_error (&e);
   dbus_bus_add_match (f->eavesdropper, STOPPER_RULE, &e);
-  assert_no_error (&e);
+  test_assert_no_error (&e);
 
   if (!dbus_connection_add_filter (f->eavesdropper,
         signal_filter, f, NULL))
@@ -363,9 +263,9 @@ add_politelistener_filter (Fixture *f)
   DBusError e = DBUS_ERROR_INIT;
 
   dbus_bus_add_match (f->politelistener, POLITELISTENER_RULE, &e);
-  assert_no_error (&e);
+  test_assert_no_error (&e);
   dbus_bus_add_match (f->politelistener, STOPPER_RULE, &e);
-  assert_no_error (&e);
+  test_assert_no_error (&e);
 
   if (!dbus_connection_add_filter (f->politelistener,
         signal_filter, f, NULL))
@@ -376,45 +276,21 @@ static void
 setup (Fixture *f,
     gconstpointer context G_GNUC_UNUSED)
 {
-  gchar *dbus_daemon;
-  gchar *config;
   gchar *address;
+
+  f->ctx = test_main_context_get ();
 
   f->ge = NULL;
   dbus_error_init (&f->e);
 
-  dbus_daemon = g_strdup (g_getenv ("DBUS_TEST_DAEMON"));
+  address = test_get_dbus_daemon (NULL, TEST_USER_ME, &f->daemon_pid);
 
-  if (dbus_daemon == NULL)
-    dbus_daemon = g_strdup ("dbus-daemon");
-
-  if (g_getenv ("DBUS_TEST_SYSCONFDIR") != NULL)
-    {
-      config = g_strdup_printf ("--config-file=%s/dbus-1/session.conf",
-          g_getenv ("DBUS_TEST_SYSCONFDIR"));
-    }
-  else if (g_getenv ("DBUS_TEST_DATA") != NULL)
-    {
-      config = g_strdup_printf (
-          "--config-file=%s/valid-config-files/session.conf",
-          g_getenv ("DBUS_TEST_DATA"));
-    }
-  else
-    {
-      config = g_strdup ("--session");
-    }
-
-  address = spawn_dbus_daemon (dbus_daemon, config, &f->daemon_pid);
-
-  g_free (dbus_daemon);
-  g_free (config);
-
-  f->sender = connect_to_bus (address);
+  f->sender = test_connect_to_bus (f->ctx, address);
   dbus_bus_request_name (f->sender, SENDER_NAME, DBUS_NAME_FLAG_DO_NOT_QUEUE,
       &(f->e));
-  f->receiver = connect_to_bus (address);
-  f->eavesdropper = connect_to_bus (address);
-  f->politelistener = connect_to_bus (address);
+  f->receiver = test_connect_to_bus (f->ctx, address);
+  f->eavesdropper = test_connect_to_bus (f->ctx, address);
+  f->politelistener = test_connect_to_bus (f->ctx, address);
   add_receiver_filter (f);
   add_politelistener_filter (f);
   add_eavesdropper_filter (f);
@@ -432,7 +308,7 @@ test_eavesdrop_broadcast (Fixture *f,
   while (!f->receiver_got_stopper ||
       !f->politelistener_got_stopper ||
       !f->eavesdropper_got_stopper)
-    g_main_context_iteration (NULL, TRUE);
+    test_main_context_iterate (f->ctx, TRUE);
 
   /* all the three connection can receive a broadcast */
   g_assert_cmpint (f->receiver_dst, ==, BROADCAST);
@@ -452,7 +328,7 @@ test_eavesdrop_unicast_to_sender (Fixture *f,
   while (!f->receiver_got_stopper ||
       !f->politelistener_got_stopper ||
       !f->eavesdropper_got_stopper)
-    g_main_context_iteration (NULL, TRUE);
+    test_main_context_iterate (f->ctx, TRUE);
 
   /* not directed to it and not broadcasted, they cannot receive it */
   g_assert_cmpint (f->receiver_dst, ==, NONE_YET);
@@ -472,7 +348,7 @@ test_eavesdrop_unicast_to_receiver (Fixture *f,
   while (!f->receiver_got_stopper ||
       !f->politelistener_got_stopper ||
       !f->eavesdropper_got_stopper)
-    g_main_context_iteration (NULL, TRUE);
+    test_main_context_iterate (f->ctx, TRUE);
 
   /* direct to him */
   g_assert_cmpint (f->receiver_dst, ==, TO_ME);
@@ -527,21 +403,17 @@ teardown (Fixture *f,
       f->eavesdropper = NULL;
     }
 
-#ifdef DBUS_WIN
-  TerminateProcess (f->daemon_pid, 1);
-#else
-  kill (f->daemon_pid, SIGTERM);
-#endif
-
+  test_kill_pid (f->daemon_pid);
   g_spawn_close_pid (f->daemon_pid);
+
+  test_main_context_unref (f->ctx);
 }
 
 int
 main (int argc,
     char **argv)
 {
-  g_test_init (&argc, &argv, NULL);
-  g_test_bug_base ("https://bugs.freedesktop.org/show_bug.cgi?id=");
+  test_init (&argc, &argv);
 
   g_test_add ("/eavedrop/match_keyword/broadcast", Fixture, NULL,
       setup, test_eavesdrop_broadcast, teardown);

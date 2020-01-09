@@ -6,44 +6,46 @@
 /* indicate that we are building with cmake */
 #define DBUS_CMAKE 1
 
+@AUTOPACKAGE_CONFIG_H_TEMPLATE@
+
+/*
+ * Variables defined by AC_DEFINE in ../configure.ac
+ * should be placed in this file
+*/
 #cmakedefine HAVE_GNUC_VARARGS 1
 
 #cmakedefine DBUS_CONSOLE_AUTH_DIR "@DBUS_CONSOLE_AUTH_DIR@"
 #cmakedefine DBUS_DATADIR  "@DBUS_DATADIR@"
 #cmakedefine DBUS_BINDIR   "@DBUS_BINDIR@"
+#cmakedefine DBUS_PREFIX "@DBUS_PREFIX@"
 #cmakedefine DBUS_SYSTEM_CONFIG_FILE  "@DBUS_SYSTEM_CONFIG_FILE@"
 #cmakedefine DBUS_SESSION_CONFIG_FILE "@DBUS_SESSION_CONFIG_FILE@"
 #cmakedefine DBUS_DAEMON_NAME "@DBUS_DAEMON_NAME@"
 #cmakedefine DBUS_SYSTEM_BUS_DEFAULT_ADDRESS  "@DBUS_SYSTEM_BUS_DEFAULT_ADDRESS@"
+#cmakedefine DBUS_SESSION_BUS_CONNECT_ADDRESS  "@DBUS_SESSION_BUS_CONNECT_ADDRESS@"
 #cmakedefine DBUS_MACHINE_UUID_FILE "@DBUS_MACHINE_UUID_FILE@"
-#cmakedefine DBUS_SESSION_BUS_DEFAULT_ADDRESS "@DBUS_SESSION_BUS_DEFAULT_ADDRESS@"
 #cmakedefine DBUS_DAEMONDIR "@DBUS_DAEMONDIR@"
-#cmakedefine PACKAGE "@PACKAGE@"
-/* Version number of package */
-#cmakedefine DBUS_MAJOR_VERSION @DBUS_MAJOR_VERSION@
-#cmakedefine DBUS_MINOR_VERSION @DBUS_MINOR_VERSION@
-#cmakedefine DBUS_MICRO_VERSION @DBUS_MICRO_VERSION@
-#cmakedefine DBUS_VERSION ((@DBUS_MAJOR_VERSION@ << 16) | (@DBUS_MINOR_VERSION@ << 8) | (@DBUS_MICRO_VERSION@))
-#cmakedefine DBUS_VERSION_STRING "@DBUS_VERSION_STRING@"
-#cmakedefine DBUS_ENABLE_STATS
 
-#define VERSION DBUS_VERSION_STRING
+#cmakedefine DBUS_ENABLE_STATS
 
 #define TEST_LISTEN       "@TEST_LISTEN@"
 
 // test binaries
 #define DBUS_TEST_EXEC "@DBUS_TEST_EXEC@"
 #define DBUS_EXEEXT "@EXEEXT@"
-
-/* Full path to test file test/test-exit in builddir */
-#define TEST_BUS_BINARY          "@TEST_BUS_BINARY@"
+#cmakedefine TEST_BUS_LAUNCH_BINARY "@TEST_BUS_LAUNCH_BINARY@"
 
 /* Some dbus features */
-#cmakedefine DBUS_BUILD_TESTS 1
 #cmakedefine DBUS_ENABLE_ANSI 1
 #cmakedefine DBUS_ENABLE_VERBOSE_MODE 1
-#cmakedefine DBUS_DISABLE_ASSERTS 1
+#cmakedefine DBUS_DISABLE_ASSERT 1
+#ifndef DBUS_DISABLE_ASSERT
+#  define DBUS_ENABLE_ASSERT 1
+#endif
 #cmakedefine DBUS_DISABLE_CHECKS 1
+#ifndef DBUS_DISABLE_CHECKS
+#  define DBUS_ENABLE_CHECKS 1
+#endif
 /* xmldocs */
 /* doxygen */
 #cmakedefine DBUS_GCOV_ENABLED 1
@@ -63,7 +65,6 @@
 #endif
 
 /* selinux */
-#cmakedefine DBUS_BUS_ENABLE_DNOTIFY_ON_LINUX 1
 /* kqueue */
 #cmakedefine HAVE_CONSOLE_OWNER_FILE 1
 #define DBUS_CONSOLE_OWNER_FILE "@DBUS_CONSOLE_OWNER_FILE@"
@@ -95,57 +96,84 @@
 
 #cmakedefine DBUS_VA_COPY_AS_ARRAY @DBUS_VA_COPY_AS_ARRAY@
 
+#cmakedefine DBUS_WITH_GLIB 1
+#cmakedefine GLIB_VERSION_MIN_REQUIRED @GLIB_VERSION_MIN_REQUIRED@
+#cmakedefine GLIB_VERSION_MAX_ALLOWED  @GLIB_VERSION_MAX_ALLOWED@
+
 // headers
+#cmakedefine HAVE_ALLOCA_H
+#cmakedefine HAVE_BYTESWAP_H
+#cmakedefine HAVE_CRT_EXTERNS_H
+
 /* Define to 1 if you have dirent.h */
 #cmakedefine   HAVE_DIRENT_H 1
 
-/* Define to 1 if you have io.h */
-#cmakedefine   HAVE_IO_H 1
-
-/* Define to 1 if you have grp.h */
-#cmakedefine   HAVE_GRP_H 1
-
-/* Define to 1 if you have sys/poll.h */
-#cmakedefine    HAVE_POLL 1
-
-/* Define to 1 if you have sys/time.h */
-#cmakedefine    HAVE_SYS_TIME 1
-
-/* Define to 1 if you have sys/wait.h */
-#cmakedefine    HAVE_SYS_WAIT 1
-
-/* Define to 1 if you have time.h */
-#cmakedefine   HAVE_TIME_H 1
-
-/* Define to 1 if you have ws2tcpip.h */
-#cmakedefine   HAVE_WS2TCPIP_H
-
-/* Define to 1 if you have wspiapi.h */
-#cmakedefine   HAVE_WSPIAPI_H 1
-
-/* Define to 1 if you have unistd.h */
-#cmakedefine   HAVE_UNISTD_H 1
-
-/* Define to 1 if you have stdio.h */
-#cmakedefine   HAVE_STDIO_H 1
-
-/* Define to 1 if you have sys/syslimits.h */
-#cmakedefine   HAVE_SYS_SYSLIMITS_H 1
+#cmakedefine HAVE_DLFCN_H
 
 /* Define to 1 if you have errno.h */
 #cmakedefine   HAVE_ERRNO_H 1
 
-/* Define to 1 if you have signal.h */
-#cmakedefine   HAVE_SIGNAL_H 1
+#cmakedefine HAVE_EXECINFO_H
+#cmakedefine HAVE_EXPAT_H
 
-/* Define to 1 if you have locale.h */
-#cmakedefine   HAVE_LOCALE_H 1
+/* Define to 1 if you have grp.h */
+#cmakedefine   HAVE_GRP_H 1
 
 /* Define to 1 if you have inttypes.h */
 #cmakedefine   HAVE_INTTYPES_H 1
 
+/* Define to 1 if you have io.h */
+#cmakedefine   HAVE_IO_H 1
+
+/* Define to 1 if you have locale.h */
+#cmakedefine   HAVE_LOCALE_H 1
+
+#cmakedefine HAVE_MEMORY_H
+
+/* Define to 1 if you have sys/poll.h */
+#cmakedefine    HAVE_POLL 1
+
+/* Define to 1 if you have signal.h */
+#cmakedefine   HAVE_SIGNAL_H 1
+
 /* Define to 1 if you have stdint.h */
 #cmakedefine   HAVE_STDINT_H 1
+
+#cmakedefine HAVE_STDLIB_H
+
+/* Define to 1 if you have stdio.h */
+#cmakedefine   HAVE_STDIO_H 1
+
+#cmakedefine HAVE_STRINGS_H
+#cmakedefine HAVE_STRING_H
+#cmakedefine HAVE_SYSLOG_H
+#cmakedefine HAVE_SYS_EVENTS_H
+#cmakedefine HAVE_SYS_INOTIFY_H
+#cmakedefine HAVE_SYS_PRCTL_H
+#cmakedefine HAVE_SYS_RESOURCE_H
+#cmakedefine HAVE_SYS_STAT_H
+
+/* Define to 1 if you have sys/syslimits.h */
+#cmakedefine   HAVE_SYS_SYSLIMITS_H 1
+
+/* Define to 1 if you have sys/time.h */
+#cmakedefine    HAVE_SYS_TIME_H 1
+
+#cmakedefine HAVE_SYS_TYPES_H
+
+#cmakedefine HAVE_SYS_UIO_H
+
+/* Define to 1 if you have sys/wait.h */
+#cmakedefine    HAVE_SYS_WAIT_H 1
+
+/* Define to 1 if you have time.h */
+#cmakedefine   HAVE_TIME_H 1
+
+/* Define to 1 if you have unistd.h */
+#cmakedefine   HAVE_UNISTD_H 1
+
+/* Define to 1 if you have ws2tcpip.h */
+#cmakedefine   HAVE_WS2TCPIP_H
 
 // symbols
 /* Define to 1 if you have backtrace */
@@ -193,9 +221,22 @@
 /* Define to 1 if you have strtoull */
 #cmakedefine   HAVE_STRTOULL 1
 
+/* Define to 1 if you have pip2 */
+#cmakedefine   HAVE_PIPE2
+
+#cmakedefine HAVE_ACCEPT4 1
+#cmakedefine HAVE_DIRFD 1
+#cmakedefine HAVE_INOTIFY_INIT1 1
+#cmakedefine HAVE_UNIX_FD_PASSING 1
+
 // structs
 /* Define to 1 if you have struct cmsgred */
 #cmakedefine    HAVE_CMSGCRED 1
+
+#cmakedefine FD_SETSIZE @FD_SETSIZE@
+
+#cmakedefine DBUS_USER "@DBUS_USER@"
+#cmakedefine DBUS_TEST_USER "@DBUS_TEST_USER@"
 
 // system type defines
 #if defined(_WIN32) || defined(_WIN64) || defined (_WIN32_WCE)
@@ -247,6 +288,10 @@
 
 # if defined(_MSC_VER) && !defined(inline)
 #define inline __inline
+#endif
+
+#ifdef DBUS_WIN
+#define FD_SETSIZE @FD_SETSIZE@
 #endif
 
 #endif  // _DBUS_CONFIG_H

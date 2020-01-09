@@ -29,6 +29,7 @@
 #include "dbus-protocol.h"
 #include "dbus-string.h"
 #include "dbus-list.h"
+#include "dbus-misc.h"
 
 /* NOTE: If you include any unix/windows-specific headers here, you are probably doing something
  * wrong and should be putting some code in dbus-sysdeps-unix.c or dbus-sysdeps-win.c.
@@ -45,10 +46,6 @@
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
-
-_DBUS_DEFINE_GLOBAL_LOCK (win_fds);
-_DBUS_DEFINE_GLOBAL_LOCK (sid_atom_cache);
-_DBUS_DEFINE_GLOBAL_LOCK (system_users);
 
 #ifdef DBUS_WIN
   #include <stdlib.h>
@@ -96,6 +93,8 @@ _dbus_abort (void)
 }
 
 /**
+ * @ingroup DBusMisc
+ *
  * Wrapper for setenv(). If the value is #NULL, unsets
  * the environment variable.
  *
@@ -104,13 +103,16 @@ _dbus_abort (void)
  * we can not rely on internal implementation details of
  * the underlying libc library.
  *
+ * This function is not thread-safe, because altering the environment
+ * in Unix is not thread-safe in general.
+ *
  * @param varname name of environment variable
- * @param value value of environment variable
- * @returns #TRUE on success.
+ * @param value value of environment variable, or #NULL to unset
+ * @returns #TRUE on success, #FALSE if not enough memory.
  */
 dbus_bool_t
-_dbus_setenv (const char *varname,
-              const char *value)
+dbus_setenv (const char *varname,
+             const char *value)
 {
   _dbus_assert (varname != NULL);
   
@@ -502,63 +504,37 @@ _dbus_string_parse_uint (const DBusString *str,
  * @{
  */
 
-void
-_dbus_generate_pseudorandom_bytes_buffer (char *buffer,
-                                          int   n_bytes)
-{
-  long tv_usec;
-  int i;
-  
-  /* fall back to pseudorandom */
-  _dbus_verbose ("Falling back to pseudorandom for %d bytes\n",
-                 n_bytes);
-  
-  _dbus_get_real_time (NULL, &tv_usec);
-  srand (tv_usec);
-  
-  i = 0;
-  while (i < n_bytes)
-    {
-      double r;
-      unsigned int b;
-          
-      r = rand ();
-      b = (r / (double) RAND_MAX) * 255.0;
-
-      buffer[i] = b;
-
-      ++i;
-    }
-}
-
 /**
  * Fills n_bytes of the given buffer with random bytes.
  *
  * @param buffer an allocated buffer
  * @param n_bytes the number of bytes in buffer to write to
+ * @param error location to store reason for failure
+ * @returns #TRUE on success
  */
-void
-_dbus_generate_random_bytes_buffer (char *buffer,
-                                    int   n_bytes)
+dbus_bool_t
+_dbus_generate_random_bytes_buffer (char      *buffer,
+                                    int        n_bytes,
+                                    DBusError *error)
 {
   DBusString str;
 
   if (!_dbus_string_init (&str))
     {
-      _dbus_generate_pseudorandom_bytes_buffer (buffer, n_bytes);
-      return;
+      _DBUS_SET_OOM (error);
+      return FALSE;
     }
 
-  if (!_dbus_generate_random_bytes (&str, n_bytes))
+  if (!_dbus_generate_random_bytes (&str, n_bytes, error))
     {
       _dbus_string_free (&str);
-      _dbus_generate_pseudorandom_bytes_buffer (buffer, n_bytes);
-      return;
+      return FALSE;
     }
 
   _dbus_string_copy_to_buffer (&str, buffer, n_bytes);
 
   _dbus_string_free (&str);
+  return TRUE;
 }
 
 /**
@@ -567,18 +543,20 @@ _dbus_generate_random_bytes_buffer (char *buffer,
  *
  * @param str the string
  * @param n_bytes the number of random ASCII bytes to append to string
+ * @param error location to store reason for failure
  * @returns #TRUE on success, #FALSE if no memory or other failure
  */
 dbus_bool_t
 _dbus_generate_random_ascii (DBusString *str,
-                             int         n_bytes)
+                             int         n_bytes,
+                             DBusError  *error)
 {
   static const char letters[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
   int i;
   int len;
   
-  if (!_dbus_generate_random_bytes (str, n_bytes))
+  if (!_dbus_generate_random_bytes (str, n_bytes, error))
     return FALSE;
   
   len = _dbus_string_get_length (str);
@@ -720,33 +698,23 @@ _dbus_set_errno_to_zero (void)
 }
 
 /**
- * See if errno is set
- * @returns #TRUE if errno is not 0
- */
-dbus_bool_t
-_dbus_get_is_errno_nonzero (void)
-{
-  return errno != 0;
-}
-
-/**
  * See if errno is ENOMEM
- * @returns #TRUE if errno == ENOMEM
+ * @returns #TRUE if e == ENOMEM
  */
 dbus_bool_t
-_dbus_get_is_errno_enomem (void)
+_dbus_get_is_errno_enomem (int e)
 {
-  return errno == ENOMEM;
+  return e == ENOMEM;
 }
 
 /**
  * See if errno is EINTR
- * @returns #TRUE if errno == EINTR
+ * @returns #TRUE if e == EINTR
  */
 dbus_bool_t
-_dbus_get_is_errno_eintr (void)
+_dbus_get_is_errno_eintr (int e)
 {
-  return errno == EINTR;
+  return e == EINTR;
 }
 
 /**
@@ -754,9 +722,23 @@ _dbus_get_is_errno_eintr (void)
  * @returns #TRUE if errno == EPIPE
  */
 dbus_bool_t
-_dbus_get_is_errno_epipe (void)
+_dbus_get_is_errno_epipe (int e)
 {
-  return errno == EPIPE;
+  return e == EPIPE;
+}
+
+/**
+ * See if errno is ETOOMANYREFS
+ * @returns #TRUE if errno == ETOOMANYREFS
+ */
+dbus_bool_t
+_dbus_get_is_errno_etoomanyrefs (int e)
+{
+#ifdef ETOOMANYREFS
+  return e == ETOOMANYREFS;
+#else
+  return FALSE;
+#endif
 }
 
 /**

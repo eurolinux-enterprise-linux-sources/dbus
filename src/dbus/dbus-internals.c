@@ -163,26 +163,11 @@
  */
 
 /**
- * @def _DBUS_DEFINE_GLOBAL_LOCK
- *
- * Defines a global lock variable with the given name.
- * The lock must be added to the list to initialize
- * in dbus_threads_init().
- */
-
-/**
- * @def _DBUS_DECLARE_GLOBAL_LOCK
- *
- * Expands to declaration of a global lock defined
- * with _DBUS_DEFINE_GLOBAL_LOCK.
- * The lock must be added to the list to initialize
- * in dbus_threads_init().
- */
-
-/**
  * @def _DBUS_LOCK
  *
- * Locks a global lock
+ * Locks a global lock, initializing it first if necessary.
+ *
+ * @returns #FALSE if not enough memory
  */
 
 /**
@@ -347,25 +332,22 @@ _dbus_verbose_init (void)
 */ 
 static char *_dbus_file_path_extract_elements_from_tail(const char *file,int level)
 {
-  static int prefix = -1;
+  int prefix = 0;
+  char *p = (char *)file + strlen(file);
+  int i = 0;
 
-  if (prefix == -1) 
+  for (;p >= file;p--)
     {
-      char *p = (char *)file + strlen(file);
-      int i = 0;
-      prefix = 0;
-      for (;p >= file;p--)
+      if (DBUS_IS_DIR_SEPARATOR(*p))
         {
-          if (DBUS_IS_DIR_SEPARATOR(*p))
+          if (++i >= level)
             {
-              if (++i >= level) 
-                {
-                  prefix = p-file+1;
-                  break;
-                }
-           }
-        }
+              prefix = p-file+1;
+              break;
+            }
+       }
     }
+
   return (char *)file+prefix;
 }
 
@@ -379,6 +361,16 @@ _dbus_is_verbose_real (void)
 {
   _dbus_verbose_init ();
   return verbose;
+}
+
+void _dbus_set_verbose (dbus_bool_t state)
+{
+    verbose = state;
+}
+
+dbus_bool_t _dbus_get_verbose (void)
+{
+    return verbose;
 }
 
 /**
@@ -517,7 +509,7 @@ _dbus_trace_ref (const char *obj_name,
         {
           VALGRIND_PRINTF_BACKTRACE ("%s %p ref stolen (%s)",
                                      obj_name, obj, why);
-          _dbus_verbose ("%s %p ref stolen (%s)",
+          _dbus_verbose ("%s %p ref stolen (%s)\n",
                          obj_name, obj, why);
         }
       else
@@ -525,7 +517,7 @@ _dbus_trace_ref (const char *obj_name,
           VALGRIND_PRINTF_BACKTRACE ("%s %p %d -> %d refs (%s)",
                                      obj_name, obj,
                                      old_refcount, new_refcount, why);
-          _dbus_verbose ("%s %p %d -> %d refs (%s)",
+          _dbus_verbose ("%s %p %d -> %d refs (%s)\n",
                          obj_name, obj, old_refcount, new_refcount, why);
         }
     }
@@ -654,11 +646,17 @@ _dbus_string_array_contains (const char **array,
  * there's some text about it in the spec that should also change.
  *
  * @param uuid the uuid to initialize
+ * @param error location to store reason for failure
+ * @returns #TRUE on success
  */
-void
-_dbus_generate_uuid (DBusGUID *uuid)
+dbus_bool_t
+_dbus_generate_uuid (DBusGUID  *uuid,
+                     DBusError *error)
 {
+  DBusError rand_error;
   long now;
+
+  dbus_error_init (&rand_error);
 
   /* don't use monotonic time because the UUID may be saved to disk, e.g.
    * it may persist across reboots
@@ -667,7 +665,17 @@ _dbus_generate_uuid (DBusGUID *uuid)
 
   uuid->as_uint32s[DBUS_UUID_LENGTH_WORDS - 1] = DBUS_UINT32_TO_BE (now);
   
-  _dbus_generate_random_bytes_buffer (uuid->as_bytes, DBUS_UUID_LENGTH_BYTES - 4);
+  if (!_dbus_generate_random_bytes_buffer (uuid->as_bytes,
+                                           DBUS_UUID_LENGTH_BYTES - 4,
+                                           &rand_error))
+    {
+      dbus_set_error (error, rand_error.name,
+                      "Failed to generate UUID: %s", rand_error.message);
+      dbus_error_free (&rand_error);
+      return FALSE;
+    }
+
+  return TRUE;
 }
 
 /**
@@ -763,10 +771,18 @@ _dbus_read_uuid_file_without_creating (const DBusString *filename,
   return FALSE;
 }
 
-static dbus_bool_t
-_dbus_create_uuid_file_exclusively (const DBusString *filename,
-                                    DBusGUID         *uuid,
-                                    DBusError        *error)
+/**
+ * Write the give UUID to a file.
+ *
+ * @param filename the file to write
+ * @param uuid the UUID to save
+ * @param error used to raise an error
+ * @returns #FALSE on error
+ */
+dbus_bool_t
+_dbus_write_uuid_file (const DBusString *filename,
+                       const DBusGUID   *uuid,
+                       DBusError        *error)
 {
   DBusString encoded;
 
@@ -775,8 +791,6 @@ _dbus_create_uuid_file_exclusively (const DBusString *filename,
       _DBUS_SET_OOM (error);
       return FALSE;
     }
-
-  _dbus_generate_uuid (uuid);
   
   if (!_dbus_uuid_encode (uuid, &encoded))
     {
@@ -843,11 +857,15 @@ _dbus_read_uuid_file (const DBusString *filename,
   else
     {
       dbus_error_free (&read_error);
-      return _dbus_create_uuid_file_exclusively (filename, uuid, error);
+
+      if (!_dbus_generate_uuid (uuid, error))
+        return FALSE;
+
+      return _dbus_write_uuid_file (filename, uuid, error);
     }
 }
 
-_DBUS_DEFINE_GLOBAL_LOCK (machine_uuid);
+/* Protected by _DBUS_LOCK (machine_uuid) */
 static int machine_uuid_initialized_generation = 0;
 static DBusGUID machine_uuid;
 
@@ -859,38 +877,52 @@ static DBusGUID machine_uuid;
  * machine is reconfigured or its hardware is modified.
  * 
  * @param uuid_str string to append hex-encoded machine uuid to
- * @returns #FALSE if no memory
+ * @param error location to store reason for failure
+ * @returns #TRUE if successful
  */
 dbus_bool_t
-_dbus_get_local_machine_uuid_encoded (DBusString *uuid_str)
+_dbus_get_local_machine_uuid_encoded (DBusString *uuid_str,
+                                      DBusError  *error)
 {
-  dbus_bool_t ok;
+  dbus_bool_t ok = TRUE;
   
-  _DBUS_LOCK (machine_uuid);
+  if (!_DBUS_LOCK (machine_uuid))
+    {
+      _DBUS_SET_OOM (error);
+      return FALSE;
+    }
+
   if (machine_uuid_initialized_generation != _dbus_current_generation)
     {
-      DBusError error = DBUS_ERROR_INIT;
+      DBusError local_error = DBUS_ERROR_INIT;
 
       if (!_dbus_read_local_machine_uuid (&machine_uuid, FALSE,
-                                          &error))
+                                          &local_error))
         {          
-#ifndef DBUS_BUILD_TESTS
+#ifndef DBUS_ENABLE_EMBEDDED_TESTS
           /* For the test suite, we may not be installed so just continue silently
            * here. But in a production build, we want to be nice and loud about
            * this.
            */
           _dbus_warn_check_failed ("D-Bus library appears to be incorrectly set up; failed to read machine uuid: %s\n"
                                    "See the manual page for dbus-uuidgen to correct this issue.\n",
-                                   error.message);
+                                   local_error.message);
 #endif
           
-          dbus_error_free (&error);
+          dbus_error_free (&local_error);
           
-          _dbus_generate_uuid (&machine_uuid);
+          ok = _dbus_generate_uuid (&machine_uuid, error);
         }
     }
 
-  ok = _dbus_uuid_encode (&machine_uuid, uuid_str);
+  if (ok)
+    {
+      if (!_dbus_uuid_encode (&machine_uuid, uuid_str))
+        {
+          ok = FALSE;
+          _DBUS_SET_OOM (error);
+        }
+    }
 
   _DBUS_UNLOCK (machine_uuid);
 
@@ -953,7 +985,7 @@ _dbus_real_assert_not_reached (const char *explanation,
 }
 #endif /* DBUS_DISABLE_ASSERT */
   
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 static dbus_bool_t
 run_failing_each_malloc (int                    n_mallocs,
                          const char            *description,
@@ -1034,6 +1066,12 @@ _dbus_test_oom_handling (const char             *description,
       max_failures_to_try = 4;
     }
 
+  if (max_failures_to_try < 1)
+    {
+      _dbus_verbose ("not testing OOM handling\n");
+      return TRUE;
+    }
+
   i = setting ? max_failures_to_try - 1 : 1;
   while (i < max_failures_to_try)
     {
@@ -1048,6 +1086,6 @@ _dbus_test_oom_handling (const char             *description,
 
   return TRUE;
 }
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */
 
 /** @} */

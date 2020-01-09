@@ -38,7 +38,8 @@ DBusTransport*     _dbus_transport_ref                    (DBusTransport        
 void               _dbus_transport_unref                  (DBusTransport              *transport);
 void               _dbus_transport_disconnect             (DBusTransport              *transport);
 dbus_bool_t        _dbus_transport_get_is_connected       (DBusTransport              *transport);
-dbus_bool_t        _dbus_transport_get_is_authenticated   (DBusTransport              *transport);
+dbus_bool_t        _dbus_transport_peek_is_authenticated  (DBusTransport              *transport);
+dbus_bool_t        _dbus_transport_try_to_authenticate    (DBusTransport              *transport);
 dbus_bool_t        _dbus_transport_get_is_anonymous       (DBusTransport              *transport);
 dbus_bool_t        _dbus_transport_can_pass_unix_fd       (DBusTransport              *transport);
 
@@ -70,7 +71,7 @@ void               _dbus_transport_set_max_received_unix_fds(DBusTransport      
 long               _dbus_transport_get_max_received_unix_fds(DBusTransport              *transport);
 
 dbus_bool_t        _dbus_transport_get_socket_fd          (DBusTransport              *transport,
-                                                           int                        *fd_p);
+                                                           DBusSocket                 *fd_p);
 dbus_bool_t        _dbus_transport_get_unix_user          (DBusTransport              *transport,
                                                            unsigned long              *uid);
 dbus_bool_t        _dbus_transport_get_unix_process_id     (DBusTransport              *transport,
@@ -86,6 +87,9 @@ void               _dbus_transport_set_unix_user_function (DBusTransport        
                                                            DBusFreeFunction           *old_free_data_function);
 dbus_bool_t        _dbus_transport_get_windows_user       (DBusTransport              *transport,
                                                            char                      **windows_sid_p);
+dbus_bool_t        _dbus_transport_get_linux_security_label (DBusTransport            *transport,
+                                                           char                      **label_p);
+
 void               _dbus_transport_set_windows_user_function (DBusTransport              *transport,
                                                               DBusAllowWindowsUserFunction   function,
                                                               void                       *data,
@@ -96,6 +100,10 @@ dbus_bool_t        _dbus_transport_set_auth_mechanisms    (DBusTransport        
                                                            const char                **mechanisms);
 void               _dbus_transport_set_allow_anonymous    (DBusTransport              *transport,
                                                            dbus_bool_t                 value);
+int                _dbus_transport_get_pending_fds_count  (DBusTransport              *transport);
+void               _dbus_transport_set_pending_fds_function (DBusTransport *transport,
+                                                             void (* callback) (void *),
+                                                             void *data);
 
 /* if DBUS_ENABLE_STATS */
 void _dbus_transport_get_stats (DBusTransport  *transport,

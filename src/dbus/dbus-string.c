@@ -133,11 +133,11 @@ _dbus_string_init_preallocated (DBusString *str,
                                 int         allocate_size)
 {
   DBusRealString *real;
-  
+
+  _DBUS_STATIC_ASSERT (sizeof (DBusString) == sizeof (DBusRealString));
+
   _dbus_assert (str != NULL);
 
-  _dbus_assert (sizeof (DBusString) == sizeof (DBusRealString));
-  
   real = (DBusRealString*) str;
 
   /* It's very important not to touch anything
@@ -234,6 +234,23 @@ _dbus_string_init_const_len (DBusString *str,
 }
 
 /**
+ * Initializes a string from another string. The
+ * string must eventually be freed with _dbus_string_free().
+ *
+ * @param str memory to hold the string
+ * @param from instance from which the string is initialized
+ * @returns #TRUE on success, #FALSE if no memory
+ */
+dbus_bool_t
+_dbus_string_init_from_string(DBusString       *str,
+                              const DBusString *from)
+{
+ if (!_dbus_string_init (str))
+     return FALSE;
+ return _dbus_string_append (str, _dbus_string_get_const_data (from));
+}
+
+/**
  * Frees a string created by _dbus_string_init().
  *
  * @param str memory where the string is stored.
@@ -246,6 +263,14 @@ _dbus_string_free (DBusString *str)
   
   if (real->constant)
     return;
+
+  /* so it's safe if @p str returned by a failed
+   * _dbus_string_init call
+   * Bug: https://bugs.freedesktop.org/show_bug.cgi?id=65959
+   */
+  if (real->str == NULL)
+    return;
+
   dbus_free (real->str - real->align_offset);
 
   real->invalid = TRUE;
@@ -277,9 +302,9 @@ compact (DBusRealString *real,
   return TRUE;
 }
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 /* Not using this feature at the moment,
- * so marked DBUS_BUILD_TESTS-only
+ * so marked DBUS_ENABLE_EMBEDDED_TESTS-only
  */
 /**
  * Locks a string such that any attempts to change the string will
@@ -303,7 +328,7 @@ _dbus_string_lock (DBusString *str)
 #define MAX_WASTE 48
   compact (real, MAX_WASTE);
 }
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */
 
 static dbus_bool_t
 reallocate_for_length (DBusRealString *real,
@@ -327,14 +352,11 @@ reallocate_for_length (DBusRealString *real,
    * disable asserts to profile, you don't get this destroyer
    * of profiles.
    */
-#ifdef DBUS_DISABLE_ASSERT
-#else
-#ifdef DBUS_BUILD_TESTS
+#if defined (DBUS_ENABLE_EMBEDDED_TESTS) && !defined (DBUS_DISABLE_ASSERT)
   new_allocated = 0; /* ensure a realloc every time so that we go
                       * through all malloc failure codepaths
                       */
-#endif /* DBUS_BUILD_TESTS */
-#endif /* !DBUS_DISABLE_ASSERT */
+#endif
 
   /* But be sure we always alloc at least space for the new length */
   new_allocated = MAX (new_allocated,
@@ -933,29 +955,9 @@ _dbus_string_append (DBusString *str,
 #define ASSIGN_4_OCTETS(p, octets) \
   *((dbus_uint32_t*)(p)) = *((dbus_uint32_t*)(octets));
 
-#ifdef DBUS_HAVE_INT64
 /** assign 8 bytes from one string to another */
 #define ASSIGN_8_OCTETS(p, octets) \
   *((dbus_uint64_t*)(p)) = *((dbus_uint64_t*)(octets));
-#else
-/** assign 8 bytes from one string to another */
-#define ASSIGN_8_OCTETS(p, octets)              \
-do {                                            \
-  unsigned char *b;                             \
-                                                \
-  b = p;                                        \
-                                                \
-  *b++ = octets[0];                             \
-  *b++ = octets[1];                             \
-  *b++ = octets[2];                             \
-  *b++ = octets[3];                             \
-  *b++ = octets[4];                             \
-  *b++ = octets[5];                             \
-  *b++ = octets[6];                             \
-  *b++ = octets[7];                             \
-  _dbus_assert (b == p + 8);                    \
-} while (0)
-#endif /* DBUS_HAVE_INT64 */
 
 /**
  * Inserts 2 bytes aligned on a 2 byte boundary
@@ -969,7 +971,7 @@ do {                                            \
 dbus_bool_t
 _dbus_string_insert_2_aligned (DBusString         *str,
                                int                 insert_at,
-                               const unsigned char octets[4])
+                               const unsigned char octets[2])
 {
   DBUS_STRING_PREAMBLE (str);
   
@@ -1071,6 +1073,7 @@ _dbus_string_append_printf_valist  (DBusString        *str,
                                     const char        *format,
                                     va_list            args)
 {
+  dbus_bool_t ret = FALSE;
   int len;
   va_list args_copy;
 
@@ -1082,21 +1085,21 @@ _dbus_string_append_printf_valist  (DBusString        *str,
   len = _dbus_printf_string_upper_bound (format, args);
 
   if (len < 0)
-    return FALSE;
+    goto out;
 
   if (!_dbus_string_lengthen (str, len))
     {
-      /* don't leak the copy */
-      va_end (args_copy);
-      return FALSE;
+      goto out;
     }
   
   vsprintf ((char*) (real->str + (real->len - len)),
             format, args_copy);
+  ret = TRUE;
 
+out:
   va_end (args_copy);
 
-  return TRUE;
+  return ret;
 }
 
 /**
@@ -1896,7 +1899,7 @@ _dbus_string_skip_white_reverse (const DBusString *str,
  * @todo owen correctly notes that this is a stupid function (it was
  * written purely for test code,
  * e.g. dbus-message-builder.c). Probably should be enforced as test
- * code only with ifdef DBUS_BUILD_TESTS
+ * code only with ifdef DBUS_ENABLE_EMBEDDED_TESTS
  * 
  * @param source the source string
  * @param dest the destination string (contents are replaced)
@@ -1940,7 +1943,7 @@ _dbus_string_pop_line (DBusString *source,
   return TRUE;
 }
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 /**
  * Deletes up to and including the first blank space
  * in the string.
@@ -1959,7 +1962,7 @@ _dbus_string_delete_first_word (DBusString *str)
 }
 #endif
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 /**
  * Deletes any leading blanks in the string
  *
@@ -2220,7 +2223,7 @@ _dbus_string_starts_with_c_str (const DBusString *a,
  */
 dbus_bool_t
 _dbus_string_append_byte_as_hex (DBusString *str,
-                                 int         byte)
+                                 unsigned char byte)
 {
   const char hexdigits[16] = {
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',

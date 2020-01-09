@@ -80,7 +80,11 @@ dbus_get_local_machine_id (void)
   if (!_dbus_string_init (&uuid))
     return NULL;
 
-  if (!_dbus_get_local_machine_uuid_encoded (&uuid) ||
+  /* The documentation says dbus_get_local_machine_id() only fails on OOM;
+   * this can actually also fail if the D-Bus installation is faulty
+   * (no UUID) *and* reading a new random UUID fails, but we have no way
+   * to report that */
+  if (!_dbus_get_local_machine_uuid_encoded (&uuid, NULL) ||
       !_dbus_string_steal_data (&uuid, &s))
     {
       _dbus_string_free (&uuid);
@@ -173,7 +177,7 @@ dbus_get_version (int *major_version_p,
 
 /** @} */ /* End of public API */
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 
 #ifndef DOXYGEN_SHOULD_SKIP_THIS
 

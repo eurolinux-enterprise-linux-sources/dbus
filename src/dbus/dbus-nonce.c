@@ -31,7 +31,7 @@
 #include <stdio.h>
 
 static dbus_bool_t
-do_check_nonce (int fd, const DBusString *nonce, DBusError *error)
+do_check_nonce (DBusSocket fd, const DBusString *nonce, DBusError *error)
 {
   DBusString buffer;
   DBusString p;
@@ -53,10 +53,14 @@ do_check_nonce (int fd, const DBusString *nonce, DBusError *error)
 
   while (nleft)
     {
+      int saved_errno;
+
       n = _dbus_read_socket (fd, &p, nleft);
-      if (n == -1 && _dbus_get_is_errno_eintr())
+      saved_errno = _dbus_save_socket_errno ();
+
+      if (n == -1 && _dbus_get_is_errno_eintr (saved_errno))
         ;
-      else if (n == -1 && _dbus_get_is_errno_eagain_or_ewouldblock())
+      else if (n == -1 && _dbus_get_is_errno_eagain_or_ewouldblock (saved_errno))
         _dbus_sleep_milliseconds (100);
       else if (n==-1)
         {
@@ -74,7 +78,13 @@ do_check_nonce (int fd, const DBusString *nonce, DBusError *error)
         }
       else
         {
-          _dbus_string_append_len(&buffer, _dbus_string_get_const_data (&p), n);
+          if (!_dbus_string_append_len (&buffer, _dbus_string_get_const_data (&p), n))
+            {
+              dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
+              _dbus_string_free (&p);
+              _dbus_string_free (&buffer);
+              return FALSE;
+            }
           nleft -= n;
         }
     }
@@ -113,7 +123,15 @@ _dbus_read_nonce (const DBusString *fname, DBusString *nonce, DBusError* error)
 
   fp = fopen (_dbus_string_get_const_data (fname), "rb");
   if (!fp)
-    return FALSE;
+    {
+      dbus_set_error (error,
+		      _dbus_error_from_system_errno (),
+		      "Failed to open %s for read: %s",
+		      _dbus_string_get_const_data (fname),
+		      _dbus_strerror_from_errno ());
+      return FALSE;
+    }
+
   nread = fread (buffer, 1, sizeof buffer - 1, fp);
   fclose (fp);
   if (!nread)
@@ -130,25 +148,25 @@ _dbus_read_nonce (const DBusString *fname, DBusString *nonce, DBusError* error)
   return TRUE;
 }
 
-int
-_dbus_accept_with_noncefile (int listen_fd, const DBusNonceFile *noncefile)
+DBusSocket
+_dbus_accept_with_noncefile (DBusSocket listen_fd, const DBusNonceFile *noncefile)
 {
-  int fd;
+  DBusSocket fd;
   DBusString nonce;
 
   _dbus_assert (noncefile != NULL);
   if (!_dbus_string_init (&nonce))
-    return -1;
+    return _dbus_socket_get_invalid ();
   //PENDING(kdab): set better errors
   if (_dbus_read_nonce (_dbus_noncefile_get_path(noncefile), &nonce, NULL) != TRUE)
-    return -1;
+    return _dbus_socket_get_invalid ();
   fd = _dbus_accept (listen_fd);
-  if (_dbus_socket_is_invalid (fd))
+  if (!_dbus_socket_is_valid (fd))
     return fd;
   if (do_check_nonce(fd, &nonce, NULL) != TRUE) {
     _dbus_verbose ("nonce check failed. Closing socket.\n");
     _dbus_close_socket(fd, NULL);
-    return -1;
+    return _dbus_socket_get_invalid ();
   }
 
   return fd;
@@ -168,9 +186,8 @@ generate_and_write_nonce (const DBusString *filename, DBusError *error)
       return FALSE;
     }
 
-  if (!_dbus_generate_random_bytes (&nonce, 16))
+  if (!_dbus_generate_random_bytes (&nonce, 16, error))
     {
-      dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
       _dbus_string_free (&nonce);
       return FALSE;
     }
@@ -192,7 +209,9 @@ generate_and_write_nonce (const DBusString *filename, DBusError *error)
  * indicate whether the server accepted the nonce.
  */
 dbus_bool_t
-_dbus_send_nonce (int fd, const DBusString *noncefile, DBusError *error)
+_dbus_send_nonce (DBusSocket        fd,
+                  const DBusString *noncefile,
+                  DBusError        *error)
 {
   dbus_bool_t read_result;
   int send_result;
@@ -240,6 +259,7 @@ do_noncefile_create (DBusNonceFile *noncefile,
                      dbus_bool_t use_subdir)
 {
     DBusString randomStr;
+    const char *tmp;
 
     _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
@@ -251,14 +271,16 @@ do_noncefile_create (DBusNonceFile *noncefile,
         goto on_error;
       }
 
-    if (!_dbus_generate_random_ascii (&randomStr, 8))
+    if (!_dbus_generate_random_ascii (&randomStr, 8, error))
       {
-        dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
         goto on_error;
       }
 
+    tmp = _dbus_get_tmpdir ();
+
     if (!_dbus_string_init (&noncefile->dir)
-        || !_dbus_string_append (&noncefile->dir, _dbus_get_tmpdir()))
+        || tmp == NULL
+        || !_dbus_string_append (&noncefile->dir, tmp))
       {
         dbus_set_error (error, DBUS_ERROR_NO_MEMORY, NULL);
         goto on_error;
@@ -415,7 +437,7 @@ _dbus_noncefile_get_path (const DBusNonceFile *noncefile)
  * and matches the nonce from the given nonce file
  */
 dbus_bool_t
-_dbus_noncefile_check_nonce (int fd,
+_dbus_noncefile_check_nonce (DBusSocket fd,
                              const DBusNonceFile *noncefile,
                              DBusError* error)
 {

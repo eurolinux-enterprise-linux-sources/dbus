@@ -22,9 +22,12 @@
  */
 #include <config.h>
 
-#ifdef DBUS_BUILD_TESTS
+#ifdef DBUS_ENABLE_EMBEDDED_TESTS
 
 #include "dbus-auth-script.h"
+
+#include <stdio.h>
+
 #include "dbus-auth.h"
 #include "dbus-string.h"
 #include "dbus-hash.h"
@@ -221,10 +224,15 @@ auth_set_unix_credentials(DBusAuth  *auth,
     _dbus_assert_not_reached ("no memory");
 
   if (uid != DBUS_UID_UNSET)
-    _dbus_credentials_add_unix_uid (credentials, uid);
+    {
+      if (!_dbus_credentials_add_unix_uid (credentials, uid))
+        _dbus_assert_not_reached ("no memory");
+    }
   if (pid != DBUS_PID_UNSET)
-    _dbus_credentials_add_unix_pid (credentials, pid);
-
+    {
+      if (!_dbus_credentials_add_pid (credentials, pid))
+        _dbus_assert_not_reached ("no memory");
+    }
   _dbus_auth_set_credentials (auth, credentials);
 
   _dbus_credentials_unref (credentials);
@@ -334,7 +342,7 @@ _dbus_auth_script_run (const DBusString *filename)
                                                "UNIX_ONLY"))
         {
           /* skip this file */
-          _dbus_warn ("skipping unix only auth script\n");
+          fprintf (stderr, "skipping unix only auth script\n");
           retval = TRUE;
           goto out;
         }
@@ -350,7 +358,7 @@ _dbus_auth_script_run (const DBusString *filename)
                                                "WIN_ONLY"))
         {
           /* skip this file */
-          _dbus_warn ("skipping windows only auth script\n");
+          fprintf (stderr, "skipping windows only auth script\n");
           retval = TRUE;
           goto out;
         }
@@ -527,7 +535,7 @@ _dbus_auth_script_run (const DBusString *filename)
                     goto out;
                   }
 
-                _dbus_string_delete (&to_send, where, strlen ("USERID_HEX"));
+                _dbus_string_delete (&to_send, where, (int) strlen ("USERID_HEX"));
                 
                 if (!_dbus_string_hex_encode (&username, 0,
 					      &to_send, where))
@@ -560,7 +568,7 @@ _dbus_auth_script_run (const DBusString *filename)
                     goto out;
                   }
 
-                _dbus_string_delete (&to_send, where, strlen ("USERNAME_HEX"));
+                _dbus_string_delete (&to_send, where, (int) strlen ("USERNAME_HEX"));
                 
                 if (!_dbus_string_hex_encode (&username, 0,
 					      &to_send, where))
@@ -584,11 +592,11 @@ _dbus_auth_script_run (const DBusString *filename)
               {
                 _dbus_warn ("not enough memory to call bytes_received, or can't add bytes to auth object already in end state\n");
                 _dbus_string_free (&to_send);
-                _dbus_auth_return_buffer (auth, buffer, 0);
+                _dbus_auth_return_buffer (auth, buffer);
                 goto out;
               }
 
-            _dbus_auth_return_buffer (auth, buffer, _dbus_string_get_length (&to_send));
+            _dbus_auth_return_buffer (auth, buffer);
           }
           
           _dbus_string_free (&to_send);
@@ -800,4 +808,4 @@ _dbus_auth_script_run (const DBusString *filename)
 }
 
 /** @} */
-#endif /* DBUS_BUILD_TESTS */
+#endif /* DBUS_ENABLE_EMBEDDED_TESTS */

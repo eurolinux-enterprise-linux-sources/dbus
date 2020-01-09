@@ -1,10 +1,8 @@
 #include <config.h>
 #include <dbus/dbus.h>
 
-#define DBUS_COMPILATION /* cheat and use dbus-sysdeps */
 #include <dbus/dbus-sysdeps.h>
 #include <dbus/dbus-spawn.h>
-#undef DBUS_COMPILATION
 #include <stdio.h>
 
 static void
@@ -18,7 +16,7 @@ main (int argc, char **argv)
 {
   char **argv_copy;
   int i;
-  DBusError error;
+  DBusError error = DBUS_ERROR_INIT;
   
   if (argc < 2)
     {
@@ -32,7 +30,7 @@ main (int argc, char **argv)
     argv_copy [i] = argv[i + 1];
   argv_copy[argc - 1] = NULL;
   
-  if (!_dbus_spawn_async_with_babysitter (NULL, argv_copy, NULL, setup_func, NULL, &error))
+  if (!_dbus_spawn_async_with_babysitter (NULL, argv_copy[0], argv_copy, NULL, setup_func, NULL, &error))
     {
       fprintf (stderr, "Could not launch application: \"%s\"\n",
 	       error.message);

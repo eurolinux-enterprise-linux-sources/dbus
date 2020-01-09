@@ -1,0 +1,28 @@
+From f988e7327e5d8f372cc0c7d1478d12a74be113d3 Mon Sep 17 00:00:00 2001
+From: David King <amigadave@amigadave.com>
+Date: Fri, 15 Sep 2017 14:01:53 +0100
+Subject: [PATCH] Reduce default session bus max fd limits
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1133732
+---
+ bus/session.conf.in | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/bus/session.conf.in b/bus/session.conf.in
+index affa7f1d..294a051d 100644
+--- a/bus/session.conf.in
++++ b/bus/session.conf.in
+@@ -69,8 +69,8 @@
+   <limit name="service_start_timeout">120000</limit>  
+   <limit name="auth_timeout">240000</limit>
+   <limit name="pending_fd_timeout">150000</limit>
+-  <limit name="max_completed_connections">100000</limit>  
+-  <limit name="max_incomplete_connections">10000</limit>
++  <limit name="max_completed_connections">900</limit>
++  <limit name="max_incomplete_connections">92</limit>
+   <limit name="max_connections_per_user">100000</limit>
+   <limit name="max_pending_service_starts">10000</limit>
+   <limit name="max_names_per_connection">50000</limit>
+-- 
+2.13.5
+

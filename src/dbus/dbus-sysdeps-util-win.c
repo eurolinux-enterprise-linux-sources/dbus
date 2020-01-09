@@ -54,7 +54,7 @@
  * Does the chdir, fork, setsid, etc. to become a daemon process.
  *
  * @param pidfile #NULL, or pidfile to create
- * @param print_pid_fd file descriptor to print daemon's pid to, or -1 for none
+ * @param print_pid_pipe file descriptor to print daemon's pid to, or -1 for none
  * @param error return location for errors
  * @param keep_umask #TRUE to keep the original umask
  * @returns #FALSE on failure
@@ -65,7 +65,9 @@ _dbus_become_daemon (const DBusString *pidfile,
                      DBusError        *error,
                      dbus_bool_t       keep_umask)
 {
-  return TRUE;
+  dbus_set_error (error, DBUS_ERROR_NOT_SUPPORTED,
+                  "Cannot daemonize on Windows");
+  return FALSE;
 }
 
 /**
@@ -256,13 +258,46 @@ _dbus_change_to_daemon_user  (const char    *user,
   return TRUE;
 }
 
-void
-_dbus_request_file_descriptor_limit (unsigned int limit)
+static void
+fd_limit_not_supported (DBusError *error)
 {
+  dbus_set_error (error, DBUS_ERROR_NOT_SUPPORTED,
+                  "cannot change fd limit on this platform");
+}
+
+DBusRLimit *
+_dbus_rlimit_save_fd_limit (DBusError *error)
+{
+  fd_limit_not_supported (error);
+  return NULL;
+}
+
+dbus_bool_t
+_dbus_rlimit_raise_fd_limit_if_privileged (unsigned int  desired,
+                                           DBusError    *error)
+{
+  fd_limit_not_supported (error);
+  return FALSE;
+}
+
+dbus_bool_t
+_dbus_rlimit_restore_fd_limit (DBusRLimit *saved,
+                               DBusError  *error)
+{
+  fd_limit_not_supported (error);
+  return FALSE;
 }
 
 void
-_dbus_init_system_log (void)
+_dbus_rlimit_free (DBusRLimit *lim)
+{
+  /* _dbus_rlimit_save_fd_limit() cannot return non-NULL on Windows
+   * so there cannot be anything to free */
+  _dbus_assert (lim == NULL);
+}
+
+void
+_dbus_init_system_log (dbus_bool_t is_daemon)
 {
   /* OutputDebugStringA doesn't need any special initialization, do nothing */
 }
@@ -272,8 +307,6 @@ _dbus_init_system_log (void)
  *
  * @param severity a severity value
  * @param msg a printf-style format string
- * @param args arguments for the format string
- *
  */
 void
 _dbus_system_log (DBusSystemLogSeverity severity, const char *msg, ...)
@@ -302,16 +335,18 @@ _dbus_system_logv (DBusSystemLogSeverity severity, const char *msg, va_list args
 {
   char *s = "";
   char buf[1024];
-  
+  char format[1024];
+
   switch(severity) 
    {
      case DBUS_SYSTEM_LOG_INFO: s = "info"; break;
+     case DBUS_SYSTEM_LOG_WARNING: s = "warning"; break;
      case DBUS_SYSTEM_LOG_SECURITY: s = "security"; break;
      case DBUS_SYSTEM_LOG_FATAL: s = "fatal"; break;
    }
    
-  sprintf(buf,"%s%s",s,msg);
-  vsprintf(buf,buf,args);
+  snprintf(format, sizeof(format), "%s%s", s ,msg);
+  vsnprintf(buf, sizeof(buf), format, args);
   OutputDebugStringA(buf);
   
   if (severity == DBUS_SYSTEM_LOG_FATAL)
@@ -346,7 +381,6 @@ _dbus_stat(const DBusString *filename,
   const char *filename_c;
   WIN32_FILE_ATTRIBUTE_DATA wfad;
   char *lastdot;
-  DWORD rc;
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
@@ -424,155 +458,15 @@ _dbus_stat(const DBusString *filename,
   return TRUE;
 }
 
-
-/* This file is part of the KDE project
-Copyright (C) 2000 Werner Almesberger
-
-libc/sys/linux/sys/dirent.h - Directory entry as returned by readdir
-
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU Library General Public
-License as published by the Free Software Foundation; either
-version 2 of the License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-Library General Public License for more details.
-
-You should have received a copy of the GNU Library General Public License
-along with this program; see the file COPYING.  If not, write to
-the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
-Boston, MA 02110-1301, USA.
-*/
-#define HAVE_NO_D_NAMLEN	/* no struct dirent->d_namlen */
-#define HAVE_DD_LOCK  		/* have locking mechanism */
-
-#define MAXNAMLEN 255		/* sizeof(struct dirent.d_name)-1 */
-
-#define __dirfd(dir) (dir)->dd_fd
-
-/* struct dirent - same as Unix */
-struct dirent
-  {
-    long d_ino;                    /* inode (always 1 in WIN32) */
-    off_t d_off;                /* offset to this dirent */
-    unsigned short d_reclen;    /* length of d_name */
-    char d_name[_MAX_FNAME+1];    /* filename (null terminated) */
-  };
-
-/* typedef DIR - not the same as Unix */
-typedef struct
-  {
-    HANDLE handle;              /* FindFirst/FindNext handle */
-    short offset;               /* offset into directory */
-    short finished;             /* 1 if there are not more files */
-    WIN32_FIND_DATAA fileinfo;  /* from FindFirst/FindNext */
-    char *dir;                  /* the dir we are reading */
-    struct dirent dent;         /* the dirent to return */
-  }
-DIR;
-
-/**********************************************************************
-* Implement dirent-style opendir/readdir/closedir on Window 95/NT
-*
-* Functions defined are opendir(), readdir() and closedir() with the
-* same prototypes as the normal dirent.h implementation.
-*
-* Does not implement telldir(), seekdir(), rewinddir() or scandir().
-* The dirent struct is compatible with Unix, except that d_ino is
-* always 1 and d_off is made up as we go along.
-*
-* Error codes are not available with errno but GetLastError.
-*
-* The DIR typedef is not compatible with Unix.
-**********************************************************************/
-
-static DIR * _dbus_opendir(const char *dir)
-{
-  DIR *dp;
-  char *filespec;
-  HANDLE handle;
-  int index;
-
-  filespec = malloc(strlen(dir) + 2 + 1);
-  strcpy(filespec, dir);
-  index = strlen(filespec) - 1;
-  if (index >= 0 && (filespec[index] == '/' || filespec[index] == '\\'))
-    filespec[index] = '\0';
-  strcat(filespec, "\\*");
-
-  dp = (DIR *)malloc(sizeof(DIR));
-  dp->offset = 0;
-  dp->finished = 0;
-  dp->dir = strdup(dir);
-
-  handle = FindFirstFileA(filespec, &(dp->fileinfo));
-  if (handle == INVALID_HANDLE_VALUE)
-    {
-      if (GetLastError() == ERROR_NO_MORE_FILES)
-        dp->finished = 1;
-      else
-        return NULL;
-    }
-
-  dp->handle = handle;
-  free(filespec);
-
-  return dp;
-}
-
-static struct dirent * _dbus_readdir(DIR *dp)
-{
-  int saved_err = GetLastError();
-
-  if (!dp || dp->finished)
-    return NULL;
-
-  if (dp->offset != 0)
-    {
-      if (FindNextFileA(dp->handle, &(dp->fileinfo)) == 0)
-        {
-          if (GetLastError() == ERROR_NO_MORE_FILES)
-            {
-              SetLastError(saved_err);
-              dp->finished = 1;
-            }
-          return NULL;
-        }
-    }
-  dp->offset++;
-  
-  strncpy(dp->dent.d_name, dp->fileinfo.cFileName, _MAX_FNAME);
-  dp->dent.d_ino = 1;
-  dp->dent.d_reclen = strlen(dp->dent.d_name);
-  dp->dent.d_off = dp->offset;
-  
-  return &(dp->dent);
-}
-
-
-static int _dbus_closedir(DIR *dp)
-{
-  if (!dp)
-    return 0;
-  FindClose(dp->handle);
-  if (dp->dir)
-    free(dp->dir);
-  if (dp)
-    free(dp);
-
-  return 0;
-}
-
-
 /**
  * Internals of directory iterator
  */
 struct DBusDirIter
   {
-    DIR *d; /**< The DIR* from opendir() */
-
+    HANDLE handle;
+    WIN32_FIND_DATAA fileinfo;  /* from FindFirst/FindNext */
+    dbus_bool_t finished;       /* true if there are no more entries */
+    int offset;
   };
 
 /**
@@ -586,35 +480,66 @@ DBusDirIter*
 _dbus_directory_open (const DBusString *filename,
                       DBusError        *error)
 {
-  DIR *d;
   DBusDirIter *iter;
-  const char *filename_c;
+  DBusString filespec;
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
-  filename_c = _dbus_string_get_const_data (filename);
-
-  d = _dbus_opendir (filename_c);
-  if (d == NULL)
+  if (!_dbus_string_init_from_string (&filespec, filename))
     {
-      char *emsg = _dbus_win_error_string (GetLastError ());
-      dbus_set_error (error, _dbus_win_error_from_last_error (),
-                      "Failed to read directory \"%s\": %s",
-                      filename_c, emsg);
-      _dbus_win_free_error_string (emsg);
+      dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
+                      "Could not allocate memory for directory filename copy");
       return NULL;
     }
+
+  if (_dbus_string_ends_with_c_str (&filespec, "/") || _dbus_string_ends_with_c_str (&filespec, "\\") )
+    {
+      if (!_dbus_string_append (&filespec, "*"))
+        {
+          dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
+                          "Could not append filename wildcard");
+          return NULL;
+        }
+    }
+  else if (!_dbus_string_ends_with_c_str (&filespec, "*"))
+    {
+      if (!_dbus_string_append (&filespec, "\\*"))
+        {
+          dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
+                          "Could not append filename wildcard 2");
+          return NULL;
+        }
+    }
+
   iter = dbus_new0 (DBusDirIter, 1);
   if (iter == NULL)
     {
-      _dbus_closedir (d);
+      _dbus_string_free (&filespec);
       dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
                       "Could not allocate memory for directory iterator");
       return NULL;
     }
 
-  iter->d = d;
-
+  iter->finished = FALSE;
+  iter->offset = 0;
+  iter->handle = FindFirstFileA (_dbus_string_get_const_data (&filespec), &(iter->fileinfo));
+  if (iter->handle == INVALID_HANDLE_VALUE)
+    {
+      if (GetLastError () == ERROR_NO_MORE_FILES)
+        iter->finished = TRUE;
+      else
+        {
+          char *emsg = _dbus_win_error_string (GetLastError ());
+          dbus_set_error (error, _dbus_win_error_from_last_error (),
+                          "Failed to read directory \"%s\": %s",
+                          _dbus_string_get_const_data (filename), emsg);
+          _dbus_win_free_error_string (emsg);
+          dbus_free ( iter );
+          _dbus_string_free (&filespec);
+          return NULL;
+        }
+    }
+  _dbus_string_free (&filespec);
   return iter;
 }
 
@@ -622,9 +547,6 @@ _dbus_directory_open (const DBusString *filename,
  * Get next file in the directory. Will not return "." or ".."  on
  * UNIX. If an error occurs, the contents of "filename" are
  * undefined. The error is never set if the function succeeds.
- *
- * @todo for thread safety, I think we have to use
- * readdir_r(). (GLib has the same issue, should file a bug.)
  *
  * @param iter the iterator
  * @param filename string to be set to the next file in the dir
@@ -636,40 +558,55 @@ _dbus_directory_get_next_file (DBusDirIter      *iter,
                                DBusString       *filename,
                                DBusError        *error)
 {
-  struct dirent *ent;
+  int saved_err = GetLastError();
 
   _DBUS_ASSERT_ERROR_IS_CLEAR (error);
 
 again:
   SetLastError (0);
-  ent = _dbus_readdir (iter->d);
-  if (ent == NULL)
+
+  if (!iter || iter->finished)
+      return FALSE;
+
+  if (iter->offset > 0)
     {
-      if (GetLastError() != 0)
+      if (FindNextFileA (iter->handle, &(iter->fileinfo)) == 0)
         {
-          char *emsg = _dbus_win_error_string (GetLastError ());
-          dbus_set_error (error, _dbus_win_error_from_last_error (),
-                          "Failed to get next in directory: %s", emsg);
-          _dbus_win_free_error_string (emsg);
+          if (GetLastError() == ERROR_NO_MORE_FILES)
+            {
+              SetLastError(saved_err);
+              iter->finished = 1;
+            }
+          else
+            {
+              char *emsg = _dbus_win_error_string (GetLastError ());
+              dbus_set_error (error, _dbus_win_error_from_last_error (),
+                             "Failed to get next in directory: %s", emsg);
+              _dbus_win_free_error_string (emsg);
+              return FALSE;
+            }
         }
+    }
+
+  iter->offset++;
+
+  if (iter->finished)
+      return FALSE;
+
+  if (iter->fileinfo.cFileName[0] == '.' &&
+     (iter->fileinfo.cFileName[1] == '\0' ||
+        (iter->fileinfo.cFileName[1] == '.' && iter->fileinfo.cFileName[2] == '\0')))
+      goto again;
+
+  _dbus_string_set_length (filename, 0);
+  if (!_dbus_string_append (filename, iter->fileinfo.cFileName))
+    {
+      dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
+                      "No memory to read directory entry");
       return FALSE;
     }
-  else if (ent->d_name[0] == '.' &&
-           (ent->d_name[1] == '\0' ||
-            (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-    goto again;
-  else
-    {
-      _dbus_string_set_length (filename, 0);
-      if (!_dbus_string_append (filename, ent->d_name))
-        {
-          dbus_set_error (error, DBUS_ERROR_NO_MEMORY,
-                          "No memory to read directory entry");
-          return FALSE;
-        }
-      else
-        return TRUE;
-    }
+
+  return TRUE;
 }
 
 /**
@@ -678,7 +615,9 @@ again:
 void
 _dbus_directory_close (DBusDirIter *iter)
 {
-  _dbus_closedir (iter->d);
+  if (!iter)
+      return;
+  FindClose(iter->handle);
   dbus_free (iter);
 }
 
@@ -1529,4 +1468,237 @@ _dbus_command_for_pid (unsigned long  pid,
 {
   // FIXME
   return FALSE;
+}
+
+/*
+ * replaces the term DBUS_PREFIX in configure_time_path by the
+ * current dbus installation directory. On unix this function is a noop
+ *
+ * @param configure_time_path
+ * @return real path
+ */
+const char *
+_dbus_replace_install_prefix (const char *configure_time_path)
+{
+#ifndef DBUS_PREFIX
+  return configure_time_path;
+#else
+  static char retval[1000];
+  static char runtime_prefix[1000];
+  int len = 1000;
+  int i;
+
+  if (!configure_time_path)
+    return NULL;
+
+  if ((!_dbus_get_install_root(runtime_prefix, len) ||
+       strncmp (configure_time_path, DBUS_PREFIX "/",
+                strlen (DBUS_PREFIX) + 1))) {
+     strncpy (retval, configure_time_path, sizeof (retval) - 1);
+     /* strncpy does not guarantee to 0-terminate the string */
+     retval[sizeof (retval) - 1] = '\0';
+  } else {
+     size_t remaining;
+
+     strncpy (retval, runtime_prefix, sizeof (retval) - 1);
+     retval[sizeof (retval) - 1] = '\0';
+     remaining = sizeof (retval) - 1 - strlen (retval);
+     strncat (retval,
+         configure_time_path + strlen (DBUS_PREFIX) + 1,
+         remaining);
+  }
+
+  /* Somehow, in some situations, backslashes get collapsed in the string.
+   * Since windows C library accepts both forward and backslashes as
+   * path separators, convert all backslashes to forward slashes.
+   */
+
+  for(i = 0; retval[i] != '\0'; i++) {
+    if(retval[i] == '\\')
+      retval[i] = '/';
+  }
+  return retval;
+#endif
+}
+
+/**
+ * return the relocated DATADIR
+ *
+ * @returns relocated DATADIR static string
+ */
+
+static const char *
+_dbus_windows_get_datadir (void)
+{
+	return _dbus_replace_install_prefix(DBUS_DATADIR);
+}
+
+#undef DBUS_DATADIR
+#define DBUS_DATADIR _dbus_windows_get_datadir ()
+
+
+#define DBUS_STANDARD_SESSION_SERVICEDIR "/dbus-1/services"
+#define DBUS_STANDARD_SYSTEM_SERVICEDIR "/dbus-1/system-services"
+
+/**
+ * Returns the standard directories for a session bus to look for service
+ * activation files
+ *
+ * On Windows this should be data directories:
+ *
+ * %CommonProgramFiles%/dbus
+ *
+ * and
+ *
+ * relocated DBUS_DATADIR
+ *
+ * @param dirs the directory list we are returning
+ * @returns #FALSE on OOM
+ */
+
+dbus_bool_t
+_dbus_get_standard_session_servicedirs (DBusList **dirs)
+{
+  const char *common_progs;
+  DBusString servicedir_path;
+
+  if (!_dbus_string_init (&servicedir_path))
+    return FALSE;
+
+#ifdef DBUS_WINCE
+  {
+    /* On Windows CE, we adjust datadir dynamically to installation location.  */
+    const char *data_dir = _dbus_getenv ("DBUS_DATADIR");
+
+    if (data_dir != NULL)
+      {
+        if (!_dbus_string_append (&servicedir_path, data_dir))
+          goto oom;
+
+        if (!_dbus_string_append (&servicedir_path, _DBUS_PATH_SEPARATOR))
+          goto oom;
+      }
+  }
+#else
+/*
+ the code for accessing services requires absolute base pathes
+ in case DBUS_DATADIR is relative make it absolute
+*/
+#ifdef DBUS_WIN
+  {
+    DBusString p;
+
+    _dbus_string_init_const (&p, DBUS_DATADIR);
+
+    if (!_dbus_path_is_absolute (&p))
+      {
+        char install_root[1000];
+        if (_dbus_get_install_root (install_root, sizeof(install_root)))
+          if (!_dbus_string_append (&servicedir_path, install_root))
+            goto oom;
+      }
+  }
+#endif
+  if (!_dbus_string_append (&servicedir_path, DBUS_DATADIR))
+    goto oom;
+
+  if (!_dbus_string_append (&servicedir_path, _DBUS_PATH_SEPARATOR))
+    goto oom;
+#endif
+
+  common_progs = _dbus_getenv ("CommonProgramFiles");
+
+  if (common_progs != NULL)
+    {
+      if (!_dbus_string_append (&servicedir_path, common_progs))
+        goto oom;
+
+      if (!_dbus_string_append (&servicedir_path, _DBUS_PATH_SEPARATOR))
+        goto oom;
+    }
+
+  if (!_dbus_split_paths_and_append (&servicedir_path,
+                               DBUS_STANDARD_SESSION_SERVICEDIR,
+                               dirs))
+    goto oom;
+
+  _dbus_string_free (&servicedir_path);
+  return TRUE;
+
+ oom:
+  _dbus_string_free (&servicedir_path);
+  return FALSE;
+}
+
+/**
+ * Returns the standard directories for a system bus to look for service
+ * activation files
+ *
+ * On UNIX this should be the standard xdg freedesktop.org data directories:
+ *
+ * XDG_DATA_DIRS=${XDG_DATA_DIRS-/usr/local/share:/usr/share}
+ *
+ * and
+ *
+ * DBUS_DATADIR
+ *
+ * On Windows there is no system bus and this function can return nothing.
+ *
+ * @param dirs the directory list we are returning
+ * @returns #FALSE on OOM
+ */
+
+dbus_bool_t
+_dbus_get_standard_system_servicedirs (DBusList **dirs)
+{
+  *dirs = NULL;
+  return TRUE;
+}
+
+static dbus_bool_t
+_dbus_get_config_file_name (DBusString *str,
+                            const char *basename)
+{
+  DBusString tmp;
+
+  if (!_dbus_string_append (str, _dbus_windows_get_datadir ()))
+    return FALSE;
+
+  _dbus_string_init_const (&tmp, "dbus-1");
+
+  if (!_dbus_concat_dir_and_file (str, &tmp))
+    return FALSE;
+
+  _dbus_string_init_const (&tmp, basename);
+
+  if (!_dbus_concat_dir_and_file (str, &tmp))
+    return FALSE;
+
+  return TRUE;
+}
+
+/**
+ * Append the absolute path of the system.conf file
+ * (there is no system bus on Windows so this can just
+ * return FALSE and print a warning or something)
+ *
+ * @param str the string to append to
+ * @returns #FALSE if no memory
+ */
+dbus_bool_t
+_dbus_append_system_config_file (DBusString *str)
+{
+  return _dbus_get_config_file_name(str, "system.conf");
+}
+
+/**
+ * Append the absolute path of the session.conf file.
+ *
+ * @param str the string to append to
+ * @returns #FALSE if no memory
+ */
+dbus_bool_t
+_dbus_append_session_config_file (DBusString *str)
+{
+  return _dbus_get_config_file_name(str, "session.conf");
 }

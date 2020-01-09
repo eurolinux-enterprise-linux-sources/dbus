@@ -149,12 +149,6 @@ main (int argc, char *argv[])
                                          &dispatch_cond1,
                                          &io_path_cond1);
 
-  check_mutex_lock (mutex1, mutex2, FALSE);
-  check_mutex_lock (dispatch_mutex1, dispatch_mutex2, FALSE);
-  check_mutex_lock (io_path_mutex1, io_path_mutex2, FALSE);
-  check_condvar_lock (dispatch_cond1, dispatch_cond2, FALSE);
-  check_condvar_lock (io_path_cond1, io_path_cond2, FALSE);
-
   _run_iteration (conn);
   _dbus_connection_test_get_locks (conn, &mutex2,
                                          &dispatch_mutex2,

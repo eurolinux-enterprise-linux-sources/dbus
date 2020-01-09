@@ -48,8 +48,9 @@
 struct DBusCredentials {
   int refcount;
   dbus_uid_t unix_uid;
-  dbus_pid_t unix_pid;
+  dbus_pid_t pid;
   char *windows_sid;
+  char *linux_security_label;
   void *adt_audit_data;
   dbus_int32_t adt_audit_data_size;
 };
@@ -77,8 +78,9 @@ _dbus_credentials_new (void)
   
   creds->refcount = 1;
   creds->unix_uid = DBUS_UID_UNSET;
-  creds->unix_pid = DBUS_PID_UNSET;
+  creds->pid = DBUS_PID_UNSET;
   creds->windows_sid = NULL;
+  creds->linux_security_label = NULL;
   creds->adt_audit_data = NULL;
   creds->adt_audit_data_size = 0;
 
@@ -133,6 +135,7 @@ _dbus_credentials_unref (DBusCredentials    *credentials)
   if (credentials->refcount == 0)
     {
       dbus_free (credentials->windows_sid);
+      dbus_free (credentials->linux_security_label);
       dbus_free (credentials->adt_audit_data);
       dbus_free (credentials);
     }
@@ -146,10 +149,10 @@ _dbus_credentials_unref (DBusCredentials    *credentials)
  * @returns #FALSE if no memory
  */
 dbus_bool_t
-_dbus_credentials_add_unix_pid (DBusCredentials    *credentials,
-                                dbus_pid_t          pid)
+_dbus_credentials_add_pid (DBusCredentials    *credentials,
+                           dbus_pid_t          pid)
 {
-  credentials->unix_pid = pid;
+  credentials->pid = pid;
   return TRUE;
 }
 
@@ -193,6 +196,30 @@ _dbus_credentials_add_windows_sid (DBusCredentials    *credentials,
 }
 
 /**
+ * Add a Linux security label, as used by LSMs such as SELinux, Smack and
+ * AppArmor, to the credentials.
+ *
+ * @param credentials the object
+ * @param label the label
+ * @returns #FALSE if no memory
+ */
+dbus_bool_t
+_dbus_credentials_add_linux_security_label (DBusCredentials    *credentials,
+                                            const char         *label)
+{
+  char *copy;
+
+  copy = _dbus_strdup (label);
+  if (copy == NULL)
+    return FALSE;
+
+  dbus_free (credentials->linux_security_label);
+  credentials->linux_security_label = copy;
+
+  return TRUE;
+}
+
+/**
  * Add ADT audit data to the credentials.
  *
  * @param credentials the object
@@ -231,11 +258,13 @@ _dbus_credentials_include (DBusCredentials    *credentials,
   switch (type)
     {
     case DBUS_CREDENTIAL_UNIX_PROCESS_ID:
-      return credentials->unix_pid != DBUS_PID_UNSET;
+      return credentials->pid != DBUS_PID_UNSET;
     case DBUS_CREDENTIAL_UNIX_USER_ID:
       return credentials->unix_uid != DBUS_UID_UNSET;
     case DBUS_CREDENTIAL_WINDOWS_SID:
       return credentials->windows_sid != NULL;
+    case DBUS_CREDENTIAL_LINUX_SECURITY_LABEL:
+      return credentials->linux_security_label != NULL;
     case DBUS_CREDENTIAL_ADT_AUDIT_DATA_ID:
       return credentials->adt_audit_data != NULL;
     }
@@ -252,9 +281,9 @@ _dbus_credentials_include (DBusCredentials    *credentials,
  * @returns UNIX process ID
  */
 dbus_pid_t
-_dbus_credentials_get_unix_pid (DBusCredentials    *credentials)
+_dbus_credentials_get_pid (DBusCredentials    *credentials)
 {
-  return credentials->unix_pid;
+  return credentials->pid;
 }
 
 /**
@@ -281,6 +310,19 @@ const char*
 _dbus_credentials_get_windows_sid (DBusCredentials    *credentials)
 {
   return credentials->windows_sid;
+}
+
+/**
+ * Gets the Linux security label (as used by LSMs) from the credentials,
+ * or #NULL if the credentials object doesn't contain a security label.
+ *
+ * @param credentials the object
+ * @returns the security label
+ */
+const char *
+_dbus_credentials_get_linux_security_label (DBusCredentials *credentials)
+{
+  return credentials->linux_security_label;
 }
 
 /**
@@ -322,13 +364,17 @@ _dbus_credentials_are_superset (DBusCredentials    *credentials,
                                 DBusCredentials    *possible_subset)
 {
   return
-    (possible_subset->unix_pid == DBUS_PID_UNSET ||
-     possible_subset->unix_pid == credentials->unix_pid) &&
+    (possible_subset->pid == DBUS_PID_UNSET ||
+     possible_subset->pid == credentials->pid) &&
     (possible_subset->unix_uid == DBUS_UID_UNSET ||
      possible_subset->unix_uid == credentials->unix_uid) &&
     (possible_subset->windows_sid == NULL ||
      (credentials->windows_sid && strcmp (possible_subset->windows_sid,
                                           credentials->windows_sid) == 0)) &&
+    (possible_subset->linux_security_label == NULL ||
+     (credentials->linux_security_label != NULL &&
+      strcmp (possible_subset->linux_security_label,
+              credentials->linux_security_label) == 0)) &&
     (possible_subset->adt_audit_data == NULL ||
      (credentials->adt_audit_data && memcmp (possible_subset->adt_audit_data,
                                              credentials->adt_audit_data,
@@ -345,9 +391,10 @@ dbus_bool_t
 _dbus_credentials_are_empty (DBusCredentials    *credentials)
 {
   return
-    credentials->unix_pid == DBUS_PID_UNSET &&
+    credentials->pid == DBUS_PID_UNSET &&
     credentials->unix_uid == DBUS_UID_UNSET &&
     credentials->windows_sid == NULL &&
+    credentials->linux_security_label == NULL &&
     credentials->adt_audit_data == NULL;
 }
 
@@ -388,6 +435,9 @@ _dbus_credentials_add_credentials (DBusCredentials    *credentials,
                                       DBUS_CREDENTIAL_ADT_AUDIT_DATA_ID,
                                       other_credentials) &&
     _dbus_credentials_add_credential (credentials,
+                                      DBUS_CREDENTIAL_LINUX_SECURITY_LABEL,
+                                      other_credentials) &&
+    _dbus_credentials_add_credential (credentials,
                                       DBUS_CREDENTIAL_WINDOWS_SID,
                                       other_credentials);
 }
@@ -410,9 +460,9 @@ _dbus_credentials_add_credential (DBusCredentials    *credentials,
                                   DBusCredentials    *other_credentials)
 {
   if (which == DBUS_CREDENTIAL_UNIX_PROCESS_ID &&
-      other_credentials->unix_pid != DBUS_PID_UNSET)
+      other_credentials->pid != DBUS_PID_UNSET)
     {
-      if (!_dbus_credentials_add_unix_pid (credentials, other_credentials->unix_pid))
+      if (!_dbus_credentials_add_pid (credentials, other_credentials->pid))
         return FALSE;
     }
   else if (which == DBUS_CREDENTIAL_UNIX_USER_ID &&
@@ -427,6 +477,13 @@ _dbus_credentials_add_credential (DBusCredentials    *credentials,
       if (!_dbus_credentials_add_windows_sid (credentials, other_credentials->windows_sid))
         return FALSE;
     } 
+  else if (which == DBUS_CREDENTIAL_LINUX_SECURITY_LABEL &&
+           other_credentials->linux_security_label != NULL)
+    {
+      if (!_dbus_credentials_add_linux_security_label (credentials,
+            other_credentials->linux_security_label))
+        return FALSE;
+    }
   else if (which == DBUS_CREDENTIAL_ADT_AUDIT_DATA_ID &&
            other_credentials->adt_audit_data != NULL) 
     {
@@ -445,10 +502,12 @@ _dbus_credentials_add_credential (DBusCredentials    *credentials,
 void
 _dbus_credentials_clear (DBusCredentials    *credentials)
 {
-  credentials->unix_pid = DBUS_PID_UNSET;
+  credentials->pid = DBUS_PID_UNSET;
   credentials->unix_uid = DBUS_UID_UNSET;
   dbus_free (credentials->windows_sid);
   credentials->windows_sid = NULL;
+  dbus_free (credentials->linux_security_label);
+  credentials->linux_security_label = NULL;
   dbus_free (credentials->adt_audit_data);
   credentials->adt_audit_data = NULL;
   credentials->adt_audit_data_size = 0;
@@ -523,9 +582,9 @@ _dbus_credentials_to_string_append (DBusCredentials    *credentials,
         goto oom;
       join = TRUE;
     }
-  if (credentials->unix_pid != DBUS_PID_UNSET)
+  if (credentials->pid != DBUS_PID_UNSET)
     {
-      if (!_dbus_string_append_printf (string, "%spid=" DBUS_PID_FORMAT, join ? " " : "", credentials->unix_pid))
+      if (!_dbus_string_append_printf (string, "%spid=" DBUS_PID_FORMAT, join ? " " : "", credentials->pid))
         goto oom;
       join = TRUE;
     }
@@ -539,6 +598,15 @@ _dbus_credentials_to_string_append (DBusCredentials    *credentials,
     }
   else
     join = FALSE;
+
+  if (credentials->linux_security_label != NULL)
+    {
+      if (!_dbus_string_append_printf (string, "%slsm='%s'",
+                                       join ? " " : "",
+                                       credentials->linux_security_label))
+        goto oom;
+      join = TRUE;
+    }
 
   return TRUE;
 oom:
