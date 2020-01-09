@@ -9,7 +9,7 @@ Summary: D-BUS message bus
 Name: dbus
 Epoch: 1
 Version: 1.2.24
-Release: 9%{?dist}
+Release: 11%{?dist}
 URL: http://www.freedesktop.org/software/dbus/
 Source0: http://dbus.freedesktop.org/releases/dbus/%{name}-%{version}.tar.gz
 Source1: doxygen_to_devhelp.xsl
@@ -56,6 +56,9 @@ Patch7: dbus-1.2.24-fix-dbus-command-for-pid-fd-leak.patch
 
 # https://bugzilla.redhat.com/show_bug.cgi?id=1268972
 Patch8: dbus-1.2.24-add-dbus-run-session.patch
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=1725574
+Patch9: dbus-1.2.24-fix-CVE-2019-12749.patch
 
 %description
 D-BUS is a system for sending messages between applications. It is
@@ -116,6 +119,7 @@ in this separate package so server systems need not install X.
 %patch6 -p1
 %patch7 -p1
 %patch8 -p1
+%patch9 -p1
 
 autoreconf -f -i
 
@@ -253,6 +257,12 @@ fi
 %{_includedir}/*
 
 %changelog
+* Mon Jul 08 2019 David King <dking@redhat.com> - 1:1.2.24-11
+- Apply patch for CVE-2019-12749 (#1725574)
+
+* Mon Jul 08 2019 David King <dking@redhat.com> - 1:1.2.24-10
+- Fix CVE-2019-12749 (#1725574)
+
 * Tue Apr 03 2018 David King <dking@redhat.com> - 1:1.2.24-9
 - Add dbus-run-session (#1268972)
 
