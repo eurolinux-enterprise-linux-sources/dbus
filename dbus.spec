@@ -13,7 +13,7 @@ Summary: D-BUS message bus
 Name: dbus
 Epoch: 1
 Version: 1.6.12
-Release: 17%{?dist}
+Release: 14%{?dist}
 URL: http://www.freedesktop.org/software/dbus/
 #VCS: git:git://git.freedesktop.org/git/dbus/dbus
 Source0: http://dbus.freedesktop.org/releases/dbus/%{name}-%{version}.tar.gz
@@ -64,12 +64,6 @@ Patch9: dbus-1.6.12-refresh-man-pages-and-dbus-launch-help.patch
 
 # https://bugzilla.redhat.com/show_bug.cgi?id=1325870
 Patch10: dbus-1.6.12-avoid-corrupting-multiple-fds.patch
-
-# https://bugzilla.redhat.com/show_bug.cgi?id=1364485
-Patch11: dbus-1.6.12-avoid-hardcoded-selinux-constants.patch
-
-# https://bugzilla.redhat.com/show_bug.cgi?id=1356141
-Patch12: dbus-1.6.12-avoid-selinux-context-translation.patch
 
 %description
 D-BUS is a system for sending messages between applications. It is
@@ -129,8 +123,6 @@ in this separate package so server systems need not install X.
 %patch8 -p1
 %patch9 -p1
 %patch10 -p1
-%patch11 -p1
-%patch12 -p1
 
 %build
 if test -f autogen.sh; then env NOCONFIGURE=1 ./autogen.sh; else autoreconf -v -f -i; fi
@@ -276,15 +268,6 @@ fi
 %{_includedir}/*
 
 %changelog
-* Mon Sep 12 2016 David King <dking@redhat.com> - 1:1.6.12-17
-- Improve SELinux context translation patch (#1356141)
-
-* Mon Aug 22 2016 David King <dking@redhat.com> - 1:1.6.12-16
-- Fix SELinux MLS context translation (#1356141)
-
-* Mon Aug 08 2016 David King <dking@redhat.com> - 1:1.6.12-15
-- Avoid hardcoded SELinux constants (#1364485)
-
 * Tue Apr 26 2016 David King <dking@redhat.com> - 1:1.6.12-14
 - Close multiple fds correctly (#1325870)
 
