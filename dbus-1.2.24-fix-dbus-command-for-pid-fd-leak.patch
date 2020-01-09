@@ -1,0 +1,30 @@
+From d35a66241c0ab4d566b769bb7058ac467629afd3 Mon Sep 17 00:00:00 2001
+From: Sviatoslav Chagaev <sviatoslav.chagaev@gmail.com>
+Date: Tue, 10 Sep 2013 18:23:53 +0300
+Subject: [PATCH] Fix file descriptor leak in _dbus_command_for_pid
+
+Fix a file descriptor not being closed when an error codepath is taken.
+
+Bug: https://bugs.freedesktop.org/show_bug.cgi?id=69182
+Reviewed-by: Chengwei Yang <chengwei.yang@intel.com>
+[more specific commit message -smcv]
+Reviewed-by: Simon McVittie <simon.mcvittie@collabora.co.uk>
+---
+ dbus/dbus-sysdeps-util-unix.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/dbus/dbus-sysdeps-util-unix.c b/dbus/dbus-sysdeps-util-unix.c
+index 93ad253..b5114a1 100644
+--- a/dbus/dbus-sysdeps-util-unix.c
++++ b/dbus/dbus-sysdeps-util-unix.c
+@@ -1151,6 +1151,7 @@ _dbus_command_for_pid (unsigned long  pid,
+                       "Failed to read from \"%s\": %s",
+                       _dbus_string_get_const_data (&path),
+                       _dbus_strerror (errno));      
++      _dbus_close (fd, NULL);
+       goto fail;
+     }
+   
+-- 
+2.2.2
+

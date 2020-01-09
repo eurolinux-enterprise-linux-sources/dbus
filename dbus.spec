@@ -9,7 +9,7 @@ Summary: D-BUS message bus
 Name: dbus
 Epoch: 1
 Version: 1.2.24
-Release: 7%{?dist}
+Release: 8%{?dist}
 URL: http://www.freedesktop.org/software/dbus/
 Source0: http://dbus.freedesktop.org/releases/dbus/%{name}-%{version}.tar.gz
 Source1: doxygen_to_devhelp.xsl
@@ -50,6 +50,9 @@ Patch4: 0001-_dbus_header_byteswap-change-the-first-byte-of-the-m.patch
 Patch5: 0001-dbus_message_demarshal_bytes_needed-correct-a-wrong-.patch
 
 Patch6: 0001-CVE-2012-3524-Don-t-access-environment-variables-or-.patch
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=1118456
+Patch7: dbus-1.2.24-fix-dbus-command-for-pid-fd-leak.patch
 
 %description
 D-BUS is a system for sending messages between applications. It is
@@ -108,6 +111,7 @@ in this separate package so server systems need not install X.
 %patch4 -p1
 %patch5 -p1
 %patch6 -p1
+%patch7 -p1
 
 autoreconf -f -i
 
@@ -243,8 +247,12 @@ fi
 %{_includedir}/*
 
 %changelog
+* Fri Feb 06 2015 David King <dking@redhat.com> - 1:1.2.24-8
+- Fix fd leak in _dbus_command_for_pid (#1118456)
+
 * Wed Aug 22 2012 Colin Walters <walters@verbum.org> - 1:1.2.24-7
-- Resolves: #854821
+- Add patch for CVE-2012-3524
+- Resolves: #854822
 
 * Thu Jul 28 2011 Colin Walters <walters@redhat.com> - 1:1.2.24-6
 - Apply patches for CVE-2011-2200
