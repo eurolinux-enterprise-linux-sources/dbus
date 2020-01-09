@@ -9,7 +9,7 @@ Summary: D-BUS message bus
 Name: dbus
 Epoch: 1
 Version: 1.2.24
-Release: 5%{?dist}
+Release: 7%{?dist}
 URL: http://www.freedesktop.org/software/dbus/
 Source0: http://dbus.freedesktop.org/releases/dbus/%{name}-%{version}.tar.gz
 Source1: doxygen_to_devhelp.xsl
@@ -43,12 +43,13 @@ Patch1: dbus-1.0.1-generate-xml-docs.patch
 # Backported from upstream dbus-1.2
 Patch2: 0001-Fix-use-of-servicename-in-status.patch
 
-# Upstream fix for CVE-2010-4352
 Patch3: dbus-1.2.24-CVE-2010-4352.patch
 
 # These two combined fix CVE-2011-2200
 Patch4: 0001-_dbus_header_byteswap-change-the-first-byte-of-the-m.patch
 Patch5: 0001-dbus_message_demarshal_bytes_needed-correct-a-wrong-.patch
+
+Patch6: 0001-CVE-2012-3524-Don-t-access-environment-variables-or-.patch
 
 %description
 D-BUS is a system for sending messages between applications. It is
@@ -106,6 +107,7 @@ in this separate package so server systems need not install X.
 %patch3 -p1
 %patch4 -p1
 %patch5 -p1
+%patch6 -p1
 
 autoreconf -f -i
 
@@ -241,16 +243,17 @@ fi
 %{_includedir}/*
 
 %changelog
-* Wed Jul 27 2011 Colin Walters <walters@verbum.org> - 1:1.2.24-5
-- Merge changes from RHEL-6 branch:
-  * Drop default patch fuzz
-  * Merge CVE-2010-4352.patch from RHEL-6_0-Z
-- Apply patches for CVE-2011-2200
-- Resolves: #725313
+* Wed Aug 22 2012 Colin Walters <walters@verbum.org> - 1:1.2.24-7
+- Resolves: #854821
 
-* Fri Mar 18 2011 Colin Walters <walters@verbum.org> - 1:1.2.24-4
-- Apply patch for CVE-2010-4352
-- Resolves: #684852
+* Thu Jul 28 2011 Colin Walters <walters@redhat.com> - 1:1.2.24-6
+- Apply patches for CVE-2011-2200
+- Resolves: #725314
+
+* Fri Jun 10 2011 Colin Walters <walters@redhat.com> - 1:1.2.24-5
+- Drop default patch fuzz
+- Merge CVE-2010-4352.patch from RHEL-6_0-Z
+- Resolves: #684853
 
 * Mon Aug  9 2010 Colin Walters <walters@redhat.com> - 1:1.2.24-3
 - Actually apply previous patch
